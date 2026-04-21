@@ -1,0 +1,59 @@
+{
+  "_comment": "Pareto 80/20 PII Regex Filter Set. Catches 80% of critical hard-PII with minimal overhead. Serves as Layer 1 before Presidio NLP.",
+  "rules": [
+    {
+      "name": "Email Addresses",
+      "description": "Catches standard email formats. Based on simplified RFC 5322 for speed.",
+      "pattern": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b",
+      "replacement": "[MASKED_EMAIL]"
+    },
+    {
+      "name": "First and Last Name (Naive Regex)",
+      "description": "WARNING: Regex is notoriously bad at names (will capture start-of-sentence words). Included for basic coverage, but truly relies on Layer 2 (Presidio NLP) for accuracy.",
+      "pattern": "\\b[A-ZÄÖÜ][a-zäöüß]+ [A-ZÄÖÜ][a-zäöüß]+\\b",
+      "replacement": "[MASKED_NAME]"
+    },
+    {
+      "name": "IBAN",
+      "description": "Detects European IBANs with or without spaces. Absolute standard for billing/invoices.",
+      "pattern": "\\b[A-Z]{2}[0-9]{2}(?:[ ]?[0-9]{4}){4}(?:[ ]?[0-9]{1,2})?\\b",
+      "replacement": "[MASKED_IBAN]"
+    },
+    {
+      "name": "Credit Cards (Global)",
+      "description": "Detects Visa, MasterCard, Amex and Discover numbers (13-16 digits). Vital for finance logs.",
+      "pattern": "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\\b",
+      "replacement": "[MASKED_CREDIT_CARD]"
+    },
+    {
+      "name": "Phone Number (DACH & Intl)",
+      "description": "Catches standard international (+49, +43, +41, 0049) and common local formats (0151...).",
+      "pattern": "\\b(?:\\+|00)?(?:49|43|41|1)[ -]?(?:\\d[ -]?){6,14}\\b",
+      "replacement": "[MASKED_PHONE]"
+    },
+    {
+      "name": "IPv4 Address",
+      "description": "Detects IPv4 addresses. Necessary for IT Ops to prevent leaking network topologies.",
+      "pattern": "\\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\b",
+      "replacement": "[MASKED_IP]"
+    },
+    {
+      "name": "MAC Address",
+      "description": "Identifies hardware addresses (e.g. 00:1A:2B:3C:4D:5E).",
+      "pattern": "\\b(?:[0-9A-Fa-f]{2}[:-]){5}(?:[0-9A-Fa-f]{2})\\b",
+      "replacement": "[MASKED_MAC]"
+    },
+    {
+      "name": "JSON Web Tokens (JWT)",
+      "description": "Catches unencrypted OAuth2/JWT Access Tokens. Massive security risk in debug logs.",
+      "pattern": "\\beyJ[A-Za-z0-9-_=]+\\.[A-Za-z0-9-_=]+\\.?[A-Za-z0-9-_.+/=]*\\b",
+      "replacement": "[MASKED_JWT_TOKEN]"
+    },
+    {
+      "name": "AWS API Keys",
+      "description": "Standard AWS Access Key prefix (AKIA).",
+      "pattern": "\\bAKIA[0-9A-Z]{16}\\b",
+      "replacement": "[MASKED_AWS_KEY]"
+    }
+  ]
+}
