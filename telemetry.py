@@ -3,6 +3,8 @@ import json
 import os
 import re
 import threading
+import time
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ _SIMPLE_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 class TokenTracker:
+    """Track local MCP usage and estimate token costs without external services."""
     def __init__(
         self,
         *,
@@ -19,6 +22,7 @@ class TokenTracker:
         tokenizer_name: str,
         hash_filepaths: bool,
         include_vault_stats: bool,
+        vault_stats_cache_ttl_seconds: int,
         vault_path: Path | None,
         ignored_folders: list[str] | None,
     ) -> None:
@@ -27,10 +31,13 @@ class TokenTracker:
         self.tokenizer_name = tokenizer_name
         self.hash_filepaths = hash_filepaths
         self.include_vault_stats = include_vault_stats
+        self.vault_stats_cache_ttl_seconds = max(vault_stats_cache_ttl_seconds, 0)
         self.vault_path = vault_path
         self.ignored_folders = set(ignored_folders or [])
         self._lock = threading.Lock()
         self._encoding = None
+        self._vault_snapshot_cache: dict[str, int] | None = None
+        self._vault_snapshot_cached_at = 0.0
 
         if self.enabled and tokenizer_name == "cl100k_base":
             try:
@@ -60,6 +67,7 @@ class TokenTracker:
             tokenizer_name=telemetry_config.get("tokenizer", "cl100k_base"),
             hash_filepaths=telemetry_config.get("hash_filepaths", True),
             include_vault_stats=telemetry_config.get("include_vault_stats", True),
+            vault_stats_cache_ttl_seconds=telemetry_config.get("vault_stats_cache_ttl_seconds", 300),
             vault_path=vault_path,
             ignored_folders=ignored_folders,
         )
@@ -84,8 +92,14 @@ class TokenTracker:
         return digest[:16]
 
     def _vault_snapshot(self) -> dict[str, int]:
+        """Return cached vault-size metrics so validation stays cheap between calls."""
         if not self.include_vault_stats or not self.vault_path or not self.vault_path.exists():
             return {}
+
+        if self.vault_stats_cache_ttl_seconds > 0:
+            age_seconds = time.monotonic() - self._vault_snapshot_cached_at
+            if self._vault_snapshot_cache is not None and age_seconds < self.vault_stats_cache_ttl_seconds:
+                return dict(self._vault_snapshot_cache)
 
         note_count = 0
         total_md_bytes = 0
@@ -101,10 +115,14 @@ class TokenTracker:
                 except OSError:
                     continue
 
-        return {
+        snapshot = {
             "vault_note_count": note_count,
             "vault_total_md_bytes": total_md_bytes,
         }
+        if self.vault_stats_cache_ttl_seconds > 0:
+            self._vault_snapshot_cache = snapshot
+            self._vault_snapshot_cached_at = time.monotonic()
+        return dict(snapshot)
 
     def log_call(
         self,
@@ -118,12 +136,15 @@ class TokenTracker:
         meta: dict[str, Any] | None = None,
         baseline_result_tokens: int | None = None,
     ) -> None:
+        """Append a single telemetry record to the local JSONL log."""
         if not self.enabled:
             return
 
+        call_id = uuid4().hex[:12]
         arg_tokens = self.count_json_tokens(args)
         result_tokens = self.count_tokens(result)
         record: dict[str, Any] = {
+            "call_id": call_id,
             "ts": datetime.now(timezone.utc).isoformat(),
             "kind": kind,
             "name": name,
@@ -188,11 +209,25 @@ class TokenTracker:
         include_prompts: bool = True,
         name_filter: str = "",
         exclude_names: set[str] | None = None,
+        since_call_id: str = "",
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=days) if days > 0 else None
         exclude_names = exclude_names or set()
         records = self._read_records()
+        since_call_id_found = not since_call_id
+
+        if since_call_id:
+            sliced_records = []
+            marker_seen = False
+            for record in records:
+                if not marker_seen:
+                    if str(record.get("call_id", "")) == since_call_id:
+                        marker_seen = True
+                        since_call_id_found = True
+                    continue
+                sliced_records.append(record)
+            records = sliced_records
 
         totals = {
             "calls": 0,
@@ -208,6 +243,8 @@ class TokenTracker:
         by_name: dict[str, dict[str, Any]] = {}
         first_ts: datetime | None = None
         last_ts: datetime | None = None
+        first_call_id: str | None = None
+        last_call_id: str | None = None
         latest_vault_note_count: int | None = None
         latest_vault_total_md_bytes: int | None = None
 
@@ -229,6 +266,12 @@ class TokenTracker:
                 first_ts = ts
             if ts and (last_ts is None or ts > last_ts):
                 last_ts = ts
+
+            call_id = str(record.get("call_id", "")) or None
+            if first_call_id is None and call_id:
+                first_call_id = call_id
+            if call_id:
+                last_call_id = call_id
 
             latest_vault_note_count = record.get("vault_note_count", latest_vault_note_count)
             latest_vault_total_md_bytes = record.get("vault_total_md_bytes", latest_vault_total_md_bytes)
@@ -312,9 +355,13 @@ class TokenTracker:
             "days": days,
             "include_prompts": include_prompts,
             "name_filter": name_filter,
+            "since_call_id": since_call_id or None,
+            "since_call_id_found": since_call_id_found,
             "record_count": totals["calls"],
             "first_ts": first_ts.isoformat() if first_ts else None,
             "last_ts": last_ts.isoformat() if last_ts else None,
+            "first_call_id": first_call_id,
+            "last_call_id": last_call_id,
             "latest_vault_note_count": latest_vault_note_count,
             "latest_vault_total_md_bytes": latest_vault_total_md_bytes,
             "totals": totals,
@@ -336,10 +383,17 @@ class TokenTracker:
 
         if summary.get("name_filter"):
             lines.append(f"- Filtered tool: `{summary['name_filter']}`")
+        if summary.get("since_call_id"):
+            lines.append(f"- Delta since call: `{summary['since_call_id']}`")
+            lines.append(f"- Delta marker found: {'yes' if summary['since_call_id_found'] else 'no'}")
         if summary.get("first_ts"):
             lines.append(f"- First event in window: {summary['first_ts']}")
         if summary.get("last_ts"):
             lines.append(f"- Last event in window: {summary['last_ts']}")
+        if summary.get("first_call_id"):
+            lines.append(f"- First call id in report: `{summary['first_call_id']}`")
+        if summary.get("last_call_id"):
+            lines.append(f"- Last call id in report: `{summary['last_call_id']}`")
         if summary.get("latest_vault_note_count") is not None:
             lines.append(f"- Vault notes: {summary['latest_vault_note_count']}")
         if summary.get("latest_vault_total_md_bytes") is not None:
@@ -370,6 +424,17 @@ class TokenTracker:
                     "## Status",
                     "",
                     "- No telemetry log file exists yet.",
+                ]
+            )
+            return "\n".join(lines)
+
+        if summary.get("since_call_id") and not summary.get("since_call_id_found"):
+            lines.extend(
+                [
+                    "",
+                    "## Status",
+                    "",
+                    "- The requested `since_call_id` was not found in the telemetry log.",
                 ]
             )
             return "\n".join(lines)

@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this file to config.json and adjust the values for your local setup.",
+  "vault_path": "/absolute/path/to/your/obsidian/vault",
+  "ignored_folders": [
+    ".obsidian",
+    ".git",
+    ".trash"
+  ],
+  "privacy": {
+    "_comment": "Choose the language for Presidio NLP masking. Supported values: de, en.",
+    "nlp_language": "de"
+  },
+  "telemetry": {
+    "_comment": "Telemetry is local-only and optional. Enable it when you want to validate token savings and usage patterns.",
+    "enabled": false,
+    "log_path": ".mcp-telemetry/tool_usage.jsonl",
+    "tokenizer": "cl100k_base",
+    "hash_filepaths": true,
+    "include_vault_stats": true,
+    "vault_stats_cache_ttl_seconds": 300
+  }
+}

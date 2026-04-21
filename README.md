@@ -2,31 +2,32 @@
 
 A lightweight, local Model Context Protocol (MCP) server for Obsidian vaults.
 
-This project is intentionally opinionated: local-first, inspectable, privacy-aware, and small enough that the architecture itself can serve as an Applied AI showcase.
+This project is intentionally opinionated: local-first, inspectable, privacy-aware, and small enough that a reviewer can understand the entire system quickly.
 
-## Why Does This Project Exist?
+## Why This Exists
 
 Most "AI for personal knowledge" setups drift toward one of two extremes:
 
-* **Heavy infrastructure:** embeddings, vector databases, sync layers, ingestion jobs, and operational overhead.
-* **Naive prompting:** dumping large documents into the model and paying for far more context than is actually useful.
+* **Heavy infrastructure:** embeddings, vector databases, ingestion jobs, sync logic, and operational overhead.
+* **Naive prompting:** dumping whole notes into the model and paying for far more context than a query actually needs.
 
-This project exists to explore a third path:
+This project explores a third path:
 
 * keep the source of truth as plain Markdown in an Obsidian vault
-* expose only a small set of deterministic tools to the model
-* optimize for privacy, retrieval quality, and token efficiency
-* make the system understandable enough that a human can reason about every layer
+* expose a small set of deterministic tools to the model
+* retrieve only the smallest useful context first
+* apply privacy controls locally before note content leaves the machine
+* measure whether the retrieval strategy actually saves tokens
 
-In short: this is not trying to be a generic RAG platform. It is trying to be a practical, local document interface for real knowledge work.
+This is not trying to be a generic RAG platform. It is trying to be a practical local document interface for real knowledge work.
 
-## Architecture At A Glance
+## Architecture Overview
 
 ```text
 Obsidian Vault (Markdown on disk)
         |
         v
-Obsidian MCP Server (this project)
+Obsidian MCP Server
         |
         +-- Retrieval tools
         |     - search_vault
@@ -43,45 +44,48 @@ Obsidian MCP Server (this project)
         +-- Privacy layer
         |     - regex masking
         |     - optional Presidio NLP masking
+        |     - configured NLP language
         |     - per-note masking strategy
         |
         +-- Telemetry layer
-              - JSONL tool usage logs
+              - JSONL usage logs
               - token approximation
-              - savings estimates
+              - estimated savings
+              - cached vault stats
               - Markdown usage reports
         |
         v
-Claude Desktop / MCP-compatible client
+Claude Desktop / any MCP-capable client
 ```
 
-### Design Flow
+### Retrieval Flow
 
-1. Claude asks for the smallest useful context first.
-2. The server returns structured, bounded results instead of whole-document dumps.
-3. Privacy controls run locally before note content leaves the machine.
-4. Telemetry measures how much context was actually returned and how much likely got saved.
+1. The model searches the vault instead of loading whole files immediately.
+2. The server returns structured, bounded results.
+3. The model inspects outlines before reading larger notes.
+4. The model reads only the relevant section when possible.
+5. Privacy controls run locally before content is returned.
+6. Telemetry tracks what was returned and estimates savings versus naive full-note reads.
 
 ## What The Server Is Optimized For
 
-### 1. Token-Efficient Retrieval
+### Token-Efficient Retrieval
 
-Instead of loading full notes by default, the server encourages a staged retrieval flow:
+Instead of treating the vault like a bag of full documents, the server encourages staged retrieval:
 
-* `search_vault` searches note contents and filenames, with optional surrounding line context
-* `get_note_outline` reveals structure before content
-* `read_note_section` reads semantically from heading to heading
-* large sections can be paged with `offset_lines` and `max_lines`
-* `read_note` remains available as a fallback, not the default path
+* `search_vault` searches note contents and filenames and can limit search to a filepath prefix
+* `get_note_outline` exposes structure before content
+* `read_note_section` reads semantically from heading to heading and supports pagination
+* `read_note` remains available as a fallback, not the default
 
-This is basically "RAG light" built on top of deterministic Markdown structure rather than embeddings.
+This is effectively "RAG light" built on deterministic Markdown structure rather than embeddings.
 
-### 2. Local Privacy Controls
+### Local Privacy Controls
 
-The privacy model is intentionally layered:
+The privacy model is layered:
 
-* **Regex masking** runs globally and is best for domain-specific secrets such as internal IDs, API keys, or known sensitive patterns.
-* **Presidio NLP masking** is reserved for broader personal data such as names, addresses, phone numbers, or financial identifiers.
+* **Regex masking** is the fast path for known sensitive patterns such as tokens, IDs, IPs, or domain-specific secrets.
+* **Presidio NLP masking** is the deeper pass for broader personal data such as names, addresses, phone numbers, and financial identifiers.
 
 To avoid damaging technical notes, the default `balanced` mode protects:
 
@@ -89,156 +93,73 @@ To avoid damaging technical notes, the default `balanced` mode protects:
 * inline code
 * raw URLs
 
-from the Presidio NLP pass while still allowing regex redaction to run globally.
+from the NLP masking pass while still allowing regex redaction globally.
 
-### 3. Mixed-Vault Support
+### Pragmatic Telemetry
 
-Not every note should be treated the same way. A technical Bash note, a customer conversation, and an investment note have very different privacy and retrieval needs.
-
-Each note can declare its own strategy via frontmatter:
-
-```yaml
-mcp_masking: balanced
-```
-
-Available modes:
-
-* `required`: regex masking plus Presidio across the full note
-* `balanced`: regex masking globally, but code/URLs are protected from Presidio
-* `clear`: regex masking only, no Presidio
-
-Default behavior:
-
-* if a note has no `mcp_masking` field, the server falls back to `balanced`
-* the bundled MCP template defaults to `mcp_masking: balanced`
-
-### 4. Local Telemetry Instead of Guesswork
-
-The server can write local JSONL events for tool and prompt calls and estimate:
+Telemetry is optional and local-only. When enabled, it tracks:
 
 * argument tokens
 * result tokens
 * total tool-call tokens
-* estimated "saved" tokens versus naive full-note reads
-* latency and vault-size context
+* estimated saved result tokens versus naive full-note reads
+* latency
+* optional vault-size context
 
-Claude can also read these reports back through MCP or write them into the vault as Markdown notes.
+Vault stats are cached with a TTL so validation remains possible without rescanning the whole vault on every call.
 
 ## Features
 
-* **No Vector Database Required:** pure Python retrieval over local Markdown files.
-* **Semantic Token Optimization:** outlines, section reads, and chunked retrieval reduce unnecessary context.
-* **Optional Token Telemetry:** local JSONL logging with approximate token counts and savings.
-* **Built-in Telemetry Reports:** usage reports can be rendered directly in Claude or written back into Obsidian.
-* **Hybrid PII Masking:** regex plus optional Presidio-based NLP masking.
-* **Code-Aware Privacy Filtering:** code fences, inline code, and URLs are protected from NLP over-masking in `balanced` mode.
-* **Per-Note Masking Strategies:** each note can opt into `required`, `balanced`, or `clear`.
-* **Path Traversal Protection:** reads and writes are constrained to the configured vault.
-* **Inbox Zero Workflow:** `archive_note` supports safe movement from inbox-style folders into archive storage.
-* **Formatting Prompt:** the server ships with a Markdown template optimized for structured, retrieval-friendly notes.
+* Pure Python retrieval over local Markdown files
+* Structured search results instead of whole-document dumps
+* Outline-first and section-level reads for large notes
+* Optional local telemetry with token estimates and savings reports
+* Regex plus optional Presidio-based masking
+* Per-note masking strategies via frontmatter
+* Search scan-error reporting instead of silent failure
+* Path traversal protection on reads and writes
+* Smoke tests for the most important retrieval and telemetry paths
 
-## Writing For Retrieval
+## Quick Start
 
-This server works best when notes are written as small semantic blocks instead of large monolithic sections.
+### 1. Create a virtual environment
 
-Recommended style:
-
-* use clear H2 blocks for major topics
-* split large sections into focused H3 subsections
-* prefer multiple short code examples over one huge command dump
-* if one subsection grows beyond roughly 20-30 lines, split it further
-
-That is why the bundled MCP template nudges Claude toward smaller subheadings and cleaner thematic separation.
-
-## Templates And Vault Structure
-
-There are two template concepts in this setup:
-
-* `templates/note_template.md` inside this repository is the MCP server's own authoring template, exposed through the `note_format` prompt
-* your Obsidian vault may also contain normal Markdown templates such as `_Templates/Knowledge-Note.md` or Templater-based files
-
-These do not technically conflict.
-
-The practical question is only whether vault templates should be visible to MCP tools:
-
-* if you want Claude to inspect or reuse vault templates, keep them accessible
-* if you want to hide them from search and listing, add `_Templates` to `ignored_folders` in `config.json`
-
-## Setup
-
-### Why You Should Use A Virtual Environment
-
-The most common installation issues on macOS come from global Python package installs, especially with newer Python/Homebrew setups.
-
-Commands like `python3 pip install -r requirements.txt` are invalid because Python tries to execute a file named `pip`. Even the correct form, `python3 -m pip install ...`, may run into `PEP-668` restrictions on system-managed environments.
-
-The clean solution is to run the server in its own virtual environment.
-
-### Installation
-
-1. Open a terminal and go to the project directory:
-
-   ```bash
-   cd /path/to/your/obsidian-mcp
-   ```
-
-2. Create a virtual environment:
-
-   ```bash
-   python3 -m venv venv
-   ```
-
-3. Activate it:
-
-   ```bash
-   source venv/bin/activate
-   ```
-
-4. Install dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-5. Initialize Presidio / SpaCy models:
-
-   ```bash
-   ./setup_presidio.sh
-   ```
-
-6. Configure `config.json`:
-
-   * set `"vault_path"` to your actual Obsidian vault
-   * adjust `ignored_folders` as needed
-   * customize `privacy_rules.json` for your own regex redaction patterns
-
-### Optional: Enable Telemetry
-
-Telemetry is disabled by default and can be toggled in `config.json`:
-
-```json
-"telemetry": {
-  "enabled": true,
-  "log_path": ".mcp-telemetry/tool_usage.jsonl",
-  "tokenizer": "cl100k_base",
-  "hash_filepaths": true,
-  "include_vault_stats": true
-}
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Notes:
+### 2. Create your local config files
 
-* `tokenizer: cl100k_base` uses `tiktoken` for a stronger local approximation
-* counts are still approximate and are not guaranteed to match Claude billing 1:1
-* telemetry is most useful for comparing strategies and trends, not for exact invoicing
+```bash
+cp config.example.json config.json
+cp privacy_rules.example.json privacy_rules.json
+```
 
-## Claude Desktop Configuration
+Edit `config.json` and set:
+
+* `vault_path` to your actual Obsidian vault
+* `privacy.nlp_language` to `de` or `en`
+* telemetry settings if you want local usage tracking
+
+Edit `privacy_rules.json` and tailor the regex rules to your own environment.
+
+### 3. Install the Presidio language model
+
+```bash
+./setup_presidio.sh
+```
+
+The setup script reads `config.json` if it exists, otherwise `config.example.json`, and installs only the SpaCy model for the configured NLP language.
+
+### 4. Add the server to Claude Desktop
 
 On macOS, edit:
 
 `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Add a server entry that points to the Python interpreter inside your virtual environment:
+Example:
 
 ```json
 {
@@ -253,9 +174,91 @@ Add a server entry that points to the Python interpreter inside your virtual env
 }
 ```
 
-Replace `/Path/to/your/` with the real absolute path to your project.
-
 Afterwards, fully quit Claude Desktop and restart it.
+
+## Configuration
+
+### `config.example.json`
+
+This file documents the expected runtime config shape. Copy it to `config.json` for your local setup.
+
+Key settings:
+
+* `vault_path`: absolute path to your Obsidian vault
+* `ignored_folders`: folders excluded from listing and search
+* `privacy.nlp_language`: Presidio language, currently `de` or `en`
+* `telemetry.enabled`: toggle local JSONL usage tracking
+* `telemetry.include_vault_stats`: include cached vault-size metrics in telemetry
+* `telemetry.vault_stats_cache_ttl_seconds`: cache duration for vault metrics
+
+### `privacy_rules.example.json`
+
+This file documents the regex masking layer. Copy it to `privacy_rules.json` and tailor it to your environment.
+
+Use it for:
+
+* internal IDs
+* tokens or API keys
+* IPs, MAC addresses, URLs, or hostnames
+* any domain-specific patterns that general NLP models should not be trusted to catch
+
+### Per-note masking
+
+Each note can declare its own masking strategy in frontmatter:
+
+```yaml
+mcp_masking: balanced
+```
+
+Available modes:
+
+* `required`: regex masking plus Presidio across the full note
+* `balanced`: regex masking globally, but code/URLs are protected from Presidio
+* `clear`: no masking; the note is returned as-is
+
+## Telemetry Notes
+
+Telemetry is most useful for comparing strategies and trends, not exact invoicing.
+
+Important caveats:
+
+* `cl100k_base` uses `tiktoken` for a stronger local approximation
+* counts are still approximate and will not match provider billing 1:1
+* structured JSON results add some overhead, but the staged retrieval flow still tends to save substantial context versus naive whole-note reads
+
+## Repo Structure
+
+```text
+.
+├── README.md
+├── LICENSE
+├── requirements.txt
+├── server.py
+├── telemetry.py
+├── setup_presidio.sh
+├── config.example.json
+├── privacy_rules.example.json
+├── templates/
+│   └── note_template.md
+└── tests/
+    ├── test_server_smoke.py
+    └── test_telemetry.py
+```
+
+## Smoke Tests
+
+Run the lightweight regression checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The current smoke tests cover:
+
+* partial search scan failures without losing valid hits
+* telemetry error status on invalid paths
+* cached vault stats for telemetry
+* configured Presidio NLP language usage
 
 ## Example Usage
 
@@ -263,9 +266,10 @@ Try prompts like:
 
 * *"Search my vault for notes on ransomware resilience."*
 * *"Search for `hardening` and include a few surrounding lines for each hit."*
+* *"Search for `setVariable` only inside `04_Knowledge/Commvault/`."*
 * *"Show me the outline of `Linux Kompendium` before reading it."*
-* *"Read the section `Praxis / Kommandos` from this note."*
-* *"Continue that section with the next chunk."*
+* *"Read the section `Praxis / Kommandos` from this note and continue if `truncated` is true."*
+* *"Try reading `Praxis` with fuzzy heading matching enabled."*
 * *"Create a new technical knowledge note and choose an appropriate `mcp_masking` mode."*
 * *"Show me the MCP token usage report for the last 30 days."*
 * *"Write the telemetry report into `00_Inbox/MCP Tool Usage Report.md`."*

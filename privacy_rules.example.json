@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy this file to privacy_rules.json and adapt the patterns to your own environment. These regex rules are the fast masking layer used before optional Presidio NLP masking.",
+  "rules": [
+    {
+      "name": "Email Addresses",
+      "description": "Masks standard email formats.",
+      "pattern": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b",
+      "replacement": "[MASKED_EMAIL]"
+    },
+    {
+      "name": "IBAN",
+      "description": "Masks European IBAN values with or without spaces.",
+      "pattern": "\\b[A-Z]{2}[0-9]{2}(?:[ ]?[0-9]{4}){4}(?:[ ]?[0-9]{1,2})?\\b",
+      "replacement": "[MASKED_IBAN]"
+    },
+    {
+      "name": "Phone Number",
+      "description": "Masks common international phone number formats.",
+      "pattern": "\\b(?:\\+|00)?(?:49|43|41|1)[ -]?(?:\\d[ -]?){6,14}\\b",
+      "replacement": "[MASKED_PHONE]"
+    },
+    {
+      "name": "IPv4 Address",
+      "description": "Masks IPv4 addresses to avoid leaking network details.",
+      "pattern": "\\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\b",
+      "replacement": "[MASKED_IP]"
+    },
+    {
+      "name": "JSON Web Tokens (JWT)",
+      "description": "Masks unencrypted JWT-like access tokens.",
+      "pattern": "\\beyJ[A-Za-z0-9-_=]+\\.[A-Za-z0-9-_=]+\\.?[A-Za-z0-9-_.+/=]*\\b",
+      "replacement": "[MASKED_JWT_TOKEN]"
+    }
+  ]
+}

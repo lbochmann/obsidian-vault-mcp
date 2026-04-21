@@ -3,6 +3,7 @@ import shutil
 import json
 import re
 import time
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -14,24 +15,38 @@ INLINE_CODE_PATTERN = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
 VALID_MASKING_MODES = {"required", "balanced", "clear"}
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+SUPPORTED_PRESIDIO_LANGUAGES = {
+    "de": "de_core_news_lg",
+    "en": "en_core_web_lg",
+}
 
-# Read configuration
-CONFIG_PATH = Path(__file__).parent / "config.json"
-with open(CONFIG_PATH, "r") as f:
-    config = json.load(f)
+def load_json_file(preferred_name: str, fallback_name: str) -> tuple[dict, Path]:
+    """Load a local JSON file, falling back to the example file in fresh clones."""
+    base_dir = Path(__file__).parent
+    preferred_path = base_dir / preferred_name
+    fallback_path = base_dir / fallback_name
+
+    if preferred_path.exists():
+        with open(preferred_path, "r", encoding="utf-8") as f:
+            return json.load(f), preferred_path
+
+    with open(fallback_path, "r", encoding="utf-8") as f:
+        return json.load(f), fallback_path
+
+
+config, CONFIG_PATH = load_json_file("config.json", "config.example.json")
 
 VAULT_PATH = (Path(__file__).parent / config.get("vault_path", "./test_vault")).resolve()
 IGNORED_FOLDERS = config.get("ignored_folders", [".obsidian", ".git", ".trash"])
+privacy_config = config.get("privacy", {})
+NLP_LANGUAGE = str(privacy_config.get("nlp_language", "de")).strip().lower()
+if NLP_LANGUAGE not in SUPPORTED_PRESIDIO_LANGUAGES:
+    NLP_LANGUAGE = "de"
+PRESIDIO_MODEL = SUPPORTED_PRESIDIO_LANGUAGES[NLP_LANGUAGE]
 
-# Read privacy rules for masking
-PRIVACY_PATH = Path(__file__).parent / "privacy_rules.json"
-privacy_rules = []
-if PRIVACY_PATH.exists():
-    with open(PRIVACY_PATH, "r", encoding="utf-8") as f:
-        privacy_data = json.load(f)
-        privacy_rules = privacy_data.get("rules", [])
+privacy_data, PRIVACY_PATH = load_json_file("privacy_rules.json", "privacy_rules.example.json")
+privacy_rules = privacy_data.get("rules", [])
 
-# ----- Hybrid Search: Presidio NLP Integration -----
 PRESIDIO_AVAILABLE = False
 try:
     from presidio_analyzer import AnalyzerEngine
@@ -50,29 +65,26 @@ def get_presidio_engines():
         return None, None
     if ANALYZER_ENGINE is None:
         try:
-            # We configure it for German (primary) and English, since the user is in the DACH region
             configuration = {
                 "nlp_engine_name": "spacy",
                 "models": [
-                    {"lang_code": "de", "model_name": "de_core_news_lg"},
-                    {"lang_code": "en", "model_name": "en_core_web_lg"}
+                    {"lang_code": NLP_LANGUAGE, "model_name": PRESIDIO_MODEL}
                 ]
             }
             provider = NlpEngineProvider(nlp_configuration=configuration)
             nlp_engine = provider.create_engine()
-            ANALYZER_ENGINE = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["de", "en"])
+            ANALYZER_ENGINE = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[NLP_LANGUAGE])
             ANONYMIZER_ENGINE = AnonymizerEngine()
         except Exception as e:
             print(f"Warning: Presidio initialization failed (missing SpaCy model?): {e}")
-            try:
-                # Minimal fallback using default English model
-                ANALYZER_ENGINE = AnalyzerEngine()
-                ANONYMIZER_ENGINE = AnonymizerEngine()
-            except Exception:
-                pass
+            if NLP_LANGUAGE == "en":
+                try:
+                    ANALYZER_ENGINE = AnalyzerEngine()
+                    ANONYMIZER_ENGINE = AnonymizerEngine()
+                except Exception:
+                    pass
     return ANALYZER_ENGINE, ANONYMIZER_ENGINE
 
-# Initialize MCP Server
 mcp = FastMCP("Obsidian Second Brain")
 TRACKER = TokenTracker.from_config(
     config=config,
@@ -87,27 +99,74 @@ def finalize_tracked_call(
     name: str,
     started_at: float,
     args: dict,
-    result: str,
+    result,
     *,
     meta: dict | None = None,
     baseline_result_tokens: int | None = None,
+    status: str = "ok",
 ) -> str:
+    """Serialize a tool result, write telemetry, and return the serialized payload."""
+    serialized_result = serialize_tool_result(result)
     TRACKER.log_call(
         kind=kind,
         name=name,
         args=args,
-        result=result,
+        result=serialized_result,
         duration_ms=(time.perf_counter() - started_at) * 1000,
-        status="error" if result.startswith("Error:") else "ok",
+        status=status,
         meta=meta,
         baseline_result_tokens=baseline_result_tokens,
     )
-    return result
+    return serialized_result
+
+
+def serialize_tool_result(payload) -> str:
+    """Return plain strings unchanged and serialize structured payloads as JSON."""
+    if isinstance(payload, str):
+        return payload
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+def tracked_error(
+    kind: str,
+    name: str,
+    started_at: float,
+    args: dict,
+    result,
+    *,
+    meta: dict | None = None,
+    baseline_result_tokens: int | None = None,
+) -> str:
+    """Record a tracked error result with consistent telemetry semantics."""
+    return finalize_tracked_call(
+        kind,
+        name,
+        started_at,
+        args,
+        result,
+        meta=meta,
+        baseline_result_tokens=baseline_result_tokens,
+        status="error",
+    )
 
 def is_safe_path(requested_path: str) -> bool:
     """Prevents Path Traversal outside the vault."""
     target_path = (VAULT_PATH / requested_path).resolve()
     return target_path.is_relative_to(VAULT_PATH)
+
+def normalize_markdown_filepath(filepath: str) -> str:
+    """Ensure note-oriented tools consistently operate on Markdown file paths."""
+    if filepath.endswith(".md"):
+        return filepath
+    return f"{filepath}.md"
+
+def resolve_vault_target(filepath: str) -> Path:
+    """Resolve a vault-relative path to an absolute local filesystem path."""
+    return (VAULT_PATH / filepath).resolve()
+
+def resolve_markdown_target(filepath: str) -> tuple[str, Path]:
+    """Normalize a note path and resolve it inside the configured vault."""
+    normalized_filepath = normalize_markdown_filepath(filepath)
+    return normalized_filepath, resolve_vault_target(normalized_filepath)
 
 def apply_masking(text: str) -> str:
     """Applies Regex filters to mask personally identifiable information before passing it to the LLM."""
@@ -119,7 +178,7 @@ def apply_masking(text: str) -> str:
         pattern = rule.get("pattern")
         replacement = rule.get("replacement")
         if pattern and replacement:
-            # We ignore multi-line matches for simple redaction
+            # Keep the fast path simple and line-oriented.
             masked_text = re.sub(pattern, replacement, masked_text)
             
     return masked_text
@@ -206,6 +265,11 @@ def build_search_snippet(lines: list[str], match_index: int, context_lines: int)
     return apply_masking(snippet_text), start_line + 1, end_line
 
 
+def normalize_filepath_filter(filepath_filter: str) -> str:
+    normalized = filepath_filter.strip().replace("\\", "/").lstrip("/")
+    return normalized
+
+
 def collect_available_headings(lines: list[str]) -> list[str]:
     headings = []
     for line in lines:
@@ -215,11 +279,48 @@ def collect_available_headings(lines: list[str]) -> list[str]:
             headings.append(f"{'#' * level} {title}")
     return headings
 
+
+def find_best_heading_match(
+    lines: list[str],
+    target_heading: str,
+    requested_level: int | None,
+) -> tuple[int | None, int | None, str | None, float]:
+    """Return the closest heading match when the caller enables fuzzy resolution."""
+    best_index = None
+    best_level = None
+    best_line = None
+    best_score = 0.0
+
+    for idx, line in enumerate(lines):
+        parsed_heading = parse_markdown_heading(line)
+        if not parsed_heading:
+            continue
+        current_level, current_title = parsed_heading
+        if requested_level is not None and current_level != requested_level:
+            continue
+
+        normalized_title = normalize_search_text(current_title)
+        if not normalized_title:
+            continue
+
+        score = SequenceMatcher(None, target_heading, normalized_title).ratio()
+        if target_heading in normalized_title or normalized_title in target_heading:
+            score += 0.2
+
+        if score > best_score:
+            best_index = idx
+            best_level = current_level
+            best_line = line
+            best_score = score
+
+    return best_index, best_level, best_line, min(best_score, 1.0)
+
 def apply_deep_masking(text: str, masking_mode: str = "balanced") -> str:
     """Applies masking with per-note policy control for technical versus sensitive content."""
-    masked_text = apply_masking(text)
     if masking_mode == "clear":
-        return masked_text
+        return text
+
+    masked_text = apply_masking(text)
 
     if masking_mode == "required":
         protected_text = masked_text
@@ -230,7 +331,7 @@ def apply_deep_masking(text: str, masking_mode: str = "balanced") -> str:
     analyzer, anonymizer = get_presidio_engines()
     if analyzer and anonymizer:
         try:
-            results = analyzer.analyze(text=protected_text, language='de')
+            results = analyzer.analyze(text=protected_text, language=NLP_LANGUAGE)
             if results:
                 anonymized_result = anonymizer.anonymize(text=protected_text, analyzer_results=results)
                 protected_text = anonymized_result.text
@@ -254,16 +355,16 @@ def list_notes(directory: str = "") -> str:
             {"directory": directory},
             f"Error: Path '{directory}' does not exist or is invalid.",
             meta=meta,
+            status="error",
         )
 
     files = []
     for root, dirs, filenames in os.walk(target_dir):
-        # Ignore hidden folders and configured folders
+        # Skip hidden folders and configured exclusions.
         dirs[:] = [d for d in dirs if d not in IGNORED_FOLDERS and not d.startswith('.')]
         
         for name in filenames:
             if name.endswith(".md"):
-                # Relative path from Vault Root
                 rel_path = os.path.relpath(os.path.join(root, name), VAULT_PATH)
                 files.append(rel_path)
                 
@@ -336,14 +437,11 @@ def get_vault_structure(max_depth: int = 2) -> str:
 def read_note(filepath: str) -> str:
     """Reads the content of a specific Markdown file."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-        
-    target_file = (VAULT_PATH / filepath).resolve()
+    filepath, target_file = resolve_markdown_target(filepath)
     meta = {"filepath_ref": TRACKER.path_ref(filepath)}
     
     if not is_safe_path(filepath) or not target_file.exists():
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "read_note",
             started_at,
@@ -356,15 +454,15 @@ def read_note(filepath: str) -> str:
         content = f.read()
     masking_mode = get_masking_mode(content)
         
-    # Apply deep hybrid masking before data leaves the local server
+    # Apply the note-aware masking policy before content leaves the server.
     masked_content = apply_deep_masking(content, masking_mode=masking_mode)
     
-    # Observability/System Telemetry: Inject warning into the context if Presidio failed
+    # Surface degraded privacy filtering directly in the returned context.
     analyzer, _ = get_presidio_engines()
-    if not analyzer:
+    if not analyzer and masking_mode != "clear":
         warning_block = (
             "> [!WARNING] SYSTEM NOTE TO LLM\n"
-            "> The Deep PII NLP Filter (Presidio) is currently unavailable or failed to load. "
+            f"> The Deep PII NLP Filter (Presidio, configured language: {NLP_LANGUAGE}) is currently unavailable or failed to load. "
             "> Only basic Regex domain masking was applied to this file. "
             "> YOU MUST explicitly warn the user about this in your response so they are aware.\n\n"
         )
@@ -381,18 +479,29 @@ def read_note(filepath: str) -> str:
             "result_chars": len(masked_content),
             "presidio_available": bool(analyzer),
             "masking_mode": masking_mode,
+            "nlp_language": NLP_LANGUAGE,
         },
     )
 
 @mcp.tool()
-def search_vault(query: str, include_filenames: bool = True, context_lines: int = 1) -> str:
-    """Searches note contents and, optionally, filenames across the vault."""
+def search_vault(
+    query: str,
+    include_filenames: bool = True,
+    context_lines: int = 1,
+    filepath_filter: str = "",
+) -> str:
+    """Searches note contents and filenames and returns structured match data."""
     started_at = time.perf_counter()
     query_raw = query
     query = query.lower()
+    filepath_filter_normalized = normalize_filepath_filter(filepath_filter)
+    filepath_filter_lower = filepath_filter_normalized.lower()
     results = []
     matched_file_count = 0
     baseline_result_tokens = 0
+    scan_errors = []
+    scan_error_count = 0
+    max_scan_errors = 5
     
     for root, dirs, filenames in os.walk(VAULT_PATH):
         dirs[:] = [d for d in dirs if d not in IGNORED_FOLDERS and not d.startswith('.')]
@@ -404,67 +513,130 @@ def search_vault(query: str, include_filenames: bool = True, context_lines: int 
                     with open(file_path, "r", encoding="utf-8") as f:
                         content = f.read()
                     lines = content.splitlines()
-                    file_had_match = False
                     rel_path = os.path.relpath(file_path, VAULT_PATH)
+                    rel_path_lower = rel_path.lower()
 
-                    if include_filenames and query in rel_path.lower():
-                        file_had_match = True
-                        matched_file_count += 1
-                        baseline_result_tokens += TRACKER.count_tokens(content)
-                        results.append(f"[{rel_path}] Filename match")
-                        
+                    if filepath_filter_lower and not rel_path_lower.startswith(filepath_filter_lower):
+                        continue
+
+                    filename_matched = include_filenames and query in rel_path_lower
+                    content_matches = []
+
                     for i, line in enumerate(lines):
                         if query in line.lower():
-                            if not file_had_match:
-                                file_had_match = True
-                                matched_file_count += 1
-                                baseline_result_tokens += TRACKER.count_tokens(content)
                             snippet_masked, start_line, end_line = build_search_snippet(lines, i, context_lines)
-                            if start_line == end_line:
-                                line_label = f"Line {start_line}"
-                            else:
-                                line_label = f"Lines {start_line}-{end_line}"
-                            results.append(f"[{rel_path}] {line_label}:\n{snippet_masked}")
-                except Exception:
-                    pass # Ignore read errors for binary or weird files
+                            content_matches.append(
+                                {
+                                    "file": rel_path,
+                                    "match_type": "both" if filename_matched else "content",
+                                    "line": i + 1,
+                                    "line_range": [start_line, end_line],
+                                    "snippet_markdown": snippet_masked,
+                                }
+                            )
+
+                    if filename_matched or content_matches:
+                        matched_file_count += 1
+                        baseline_result_tokens += TRACKER.count_tokens(content)
+
+                    if content_matches:
+                        results.extend(content_matches)
+                    elif filename_matched:
+                        results.append(
+                            {
+                                "file": rel_path,
+                                "match_type": "filename",
+                                "line": None,
+                                "line_range": None,
+                                "snippet_markdown": None,
+                            }
+                        )
+                except Exception as exc:
+                    scan_error_count += 1
+                    if len(scan_errors) < max_scan_errors:
+                        scan_errors.append(
+                            {
+                                "file": os.path.relpath(file_path, VAULT_PATH),
+                                "error_type": type(exc).__name__,
+                            }
+                        )
                     
     if not results:
         return finalize_tracked_call(
             "tool",
             "search_vault",
             started_at,
-            {"query": query_raw, "include_filenames": include_filenames, "context_lines": context_lines},
-            f"No matches found for '{query_raw}'.",
+            {
+                "query": query_raw,
+                "include_filenames": include_filenames,
+                "context_lines": context_lines,
+                "filepath_filter": filepath_filter,
+            },
+            {
+                "ok": True,
+                "query": query_raw,
+                "filepath_filter": filepath_filter_normalized or None,
+                "include_filenames": include_filenames,
+                "context_lines": context_lines,
+                "matched_file_count": 0,
+                "result_count": 0,
+                "total_result_count": 0,
+                "results_truncated": False,
+                "scan_error_count": scan_error_count,
+                "scan_errors_truncated": scan_error_count > len(scan_errors),
+                "scan_errors": scan_errors,
+                "results": [],
+            },
             meta={
                 "query_length": len(query),
                 "match_count": 0,
                 "matched_file_count": 0,
+                "scan_error_count": scan_error_count,
                 "include_filenames": include_filenames,
                 "context_lines": context_lines,
+                "filepath_filter": filepath_filter_normalized or None,
             },
             baseline_result_tokens=0,
         )
         
-    # Limit results to save tokens
+    # Cap search results to keep the response bounded.
     max_results = 20
-    output = "\n".join(results[:max_results])
-    if len(results) > max_results:
-        output += f"\n... and {len(results) - max_results} more matches."
-        
-    result = f"Search results for '{query_raw}':\n\n{output}"
+    truncated_results = results[:max_results]
+    result = {
+        "ok": True,
+        "query": query_raw,
+        "filepath_filter": filepath_filter_normalized or None,
+        "include_filenames": include_filenames,
+        "context_lines": context_lines,
+        "matched_file_count": matched_file_count,
+        "result_count": len(truncated_results),
+        "total_result_count": len(results),
+        "results_truncated": len(results) > max_results,
+        "scan_error_count": scan_error_count,
+        "scan_errors_truncated": scan_error_count > len(scan_errors),
+        "scan_errors": scan_errors,
+        "results": truncated_results,
+    }
     return finalize_tracked_call(
         "tool",
         "search_vault",
         started_at,
-        {"query": query_raw, "include_filenames": include_filenames, "context_lines": context_lines},
+        {
+            "query": query_raw,
+            "include_filenames": include_filenames,
+            "context_lines": context_lines,
+            "filepath_filter": filepath_filter,
+        },
         result,
         meta={
             "query_length": len(query),
             "match_count": len(results),
             "matched_file_count": matched_file_count,
+            "scan_error_count": scan_error_count,
             "max_results": max_results,
             "include_filenames": include_filenames,
             "context_lines": context_lines,
+            "filepath_filter": filepath_filter_normalized or None,
             "baseline_strategy": "full_matched_files_raw",
         },
         baseline_result_tokens=baseline_result_tokens,
@@ -474,14 +646,11 @@ def search_vault(query: str, include_filenames: bool = True, context_lines: int 
 def get_note_outline(filepath: str) -> str:
     """Returns a semantic outline (table of contents) of a Markdown file by extracting its headers. Useful for token optimization."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-        
-    target_file = (VAULT_PATH / filepath).resolve()
+    filepath, target_file = resolve_markdown_target(filepath)
     meta = {"filepath_ref": TRACKER.path_ref(filepath)}
     
     if not is_safe_path(filepath) or not target_file.exists():
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "get_note_outline",
             started_at,
@@ -524,25 +693,38 @@ def get_note_outline(filepath: str) -> str:
     )
 
 @mcp.tool()
-def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_lines: int = 40) -> str:
-    """Reads a specific section under a heading and can return it in smaller paginated chunks to save tokens."""
+def read_note_section(
+    filepath: str,
+    heading: str,
+    offset_lines: int = 0,
+    max_lines: int = 40,
+    heading_fuzzy: bool = False,
+) -> str:
+    """Reads a specific section under a heading and returns structured pagination metadata."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-        
-    target_file = (VAULT_PATH / filepath).resolve()
+    filepath, target_file = resolve_markdown_target(filepath)
+    request_args = {
+        "filepath": filepath,
+        "heading": heading,
+        "offset_lines": offset_lines,
+        "max_lines": max_lines,
+        "heading_fuzzy": heading_fuzzy,
+    }
     meta = {
         "filepath_ref": TRACKER.path_ref(filepath),
         "heading_query_ref": TRACKER.path_ref(normalize_search_text(heading)),
     }
     
     if not is_safe_path(filepath) or not target_file.exists():
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "read_note_section",
             started_at,
-            {"filepath": filepath, "heading": heading, "offset_lines": offset_lines, "max_lines": max_lines},
-            f"Error: File '{filepath}' not found.",
+            request_args,
+            {
+                "ok": False,
+                "error": f"File '{filepath}' not found.",
+            },
             meta=meta,
         )
         
@@ -557,16 +739,21 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
     requested_level, target_heading = parse_heading_query(heading)
 
     if not target_heading:
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "read_note_section",
             started_at,
-            {"filepath": filepath, "heading": heading, "offset_lines": offset_lines, "max_lines": max_lines},
-            "Error: Provided heading is empty.",
+            request_args,
+            {
+                "ok": False,
+                "error": "Provided heading is empty.",
+            },
             meta=meta | {"heading_level": requested_level or 0},
         )
 
     matched_level = None
+    match_strategy = "exact"
+    match_confidence = 1.0
 
     for line in lines:
         parsed_heading = parse_markdown_heading(line)
@@ -581,30 +768,48 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
                 matched_level = current_level
                 section_lines.append(line)
         else:
-            # Drop out of section if we hit a new header of equal or higher priority
+            # Stop once a sibling or higher-level heading starts a new section.
             if parsed_heading:
                 current_level, _ = parsed_heading
                 if matched_level is not None and current_level <= matched_level:
                     break
                     
             section_lines.append(line)
+
+    if not section_lines and heading_fuzzy:
+        best_index, best_level, best_line, best_score = find_best_heading_match(lines, target_heading, requested_level)
+        if best_index is not None and best_line is not None and best_score >= 0.72:
+            match_strategy = "fuzzy"
+            match_confidence = best_score
+            matched_level = best_level
+            section_lines = [lines[best_index]]
+            for line in lines[best_index + 1:]:
+                parsed_heading = parse_markdown_heading(line)
+                if parsed_heading:
+                    current_level, _ = parsed_heading
+                    if matched_level is not None and current_level <= matched_level:
+                        break
+                section_lines.append(line)
             
     if not section_lines:
         available_preview = available_headings[:20]
-        error_message = f"Error: Heading '{heading}' not found in file."
-        if available_preview:
-            error_message += "\nAvailable headings:\n" + "\n".join(f"- {item}" for item in available_preview)
-            if len(available_headings) > len(available_preview):
-                error_message += f"\n- ... and {len(available_headings) - len(available_preview)} more"
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "read_note_section",
             started_at,
-            {"filepath": filepath, "heading": heading, "offset_lines": offset_lines, "max_lines": max_lines},
-            error_message,
+            request_args,
+            {
+                "ok": False,
+                "error": f"Heading '{heading}' not found in file.",
+                "requested_heading": heading,
+                "available_headings": available_preview,
+                "available_heading_count": len(available_headings),
+                "available_headings_truncated": len(available_headings) > len(available_preview),
+            },
             meta=meta | {
                 "heading_level": requested_level or 0,
                 "available_heading_count": len(available_headings),
+                "heading_fuzzy": heading_fuzzy,
             },
         )
 
@@ -613,12 +818,17 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
     normalized_offset = max(offset_lines, 0)
 
     if normalized_offset > len(body_lines):
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "read_note_section",
             started_at,
-            {"filepath": filepath, "heading": heading, "offset_lines": offset_lines, "max_lines": max_lines},
-            f"Error: offset_lines {offset_lines} exceeds the section length of {len(body_lines)} body lines.",
+            request_args,
+            {
+                "ok": False,
+                "error": f"offset_lines {offset_lines} exceeds the section length of {len(body_lines)} body lines.",
+                "requested_offset": offset_lines,
+                "section_total_body_lines": len(body_lines),
+            },
             meta=meta | {
                 "heading_level": matched_level or requested_level or 0,
                 "section_total_body_lines": len(body_lines),
@@ -636,32 +846,48 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
 
     content = "".join([heading_line] + chunk_body_lines)
     
-    # We apply deep masking just like in the full read
+    # Use the same masking path as full-note reads.
     masked_content = apply_deep_masking(content, masking_mode=masking_mode)
-
-    if truncated:
-        masked_content += (
-            "\n\n> [!NOTE] SECTION TRUNCATED\n"
-            f"> Returned body lines {normalized_offset + 1}-{next_offset} of {len(body_lines)}. "
-            f"Call `read_note_section` again with `offset_lines={next_offset}` to continue.\n"
-        )
     
     analyzer, _ = get_presidio_engines()
-    if not analyzer:
+    if not analyzer and masking_mode != "clear":
         warning_block = (
             "> [!WARNING] SYSTEM NOTE TO LLM\n"
-            "> The Deep PII NLP Filter (Presidio) is currently unavailable or failed to load. "
+            f"> The Deep PII NLP Filter (Presidio, configured language: {NLP_LANGUAGE}) is currently unavailable or failed to load. "
             "> Only basic Regex domain masking was applied. "
             "> YOU MUST explicitly warn the user about this in your response.\n\n"
         )
         masked_content = warning_block + masked_content
+
+    returned_start = normalized_offset + 1 if chunk_body_lines else 0
+    returned_end = next_offset if chunk_body_lines else normalized_offset
+    response_payload = {
+        "ok": True,
+        "filepath": filepath,
+        "requested_heading": heading,
+        "resolved_heading": heading_line.strip(),
+        "heading_level": matched_level or requested_level or 0,
+        "match_strategy": match_strategy,
+        "match_confidence": round(match_confidence, 4),
+        "content_markdown": masked_content,
+        "masking_mode": masking_mode,
+        "presidio_available": bool(analyzer),
+        "nlp_language": NLP_LANGUAGE,
+        "truncated": truncated,
+        "offset_lines": normalized_offset,
+        "max_lines": max_lines,
+        "returned_body_lines": len(chunk_body_lines),
+        "returned_line_range": [returned_start, returned_end] if chunk_body_lines else [],
+        "section_total_body_lines": len(body_lines),
+        "next_offset": next_offset if truncated else None,
+    }
         
     return finalize_tracked_call(
         "tool",
         "read_note_section",
         started_at,
-        {"filepath": filepath, "heading": heading, "offset_lines": offset_lines, "max_lines": max_lines},
-        masked_content,
+        request_args,
+        response_payload,
         meta=meta | {
             "heading_level": matched_level or requested_level or 0,
             "section_chars": len(content),
@@ -670,9 +896,13 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
             "max_lines": max_lines,
             "returned_body_lines": len(chunk_body_lines),
             "truncated": truncated,
+            "heading_fuzzy": heading_fuzzy,
+            "match_strategy": match_strategy,
+            "match_confidence": round(match_confidence, 4),
             "baseline_strategy": "full_note_raw",
             "presidio_available": bool(analyzer),
             "masking_mode": masking_mode,
+            "nlp_language": NLP_LANGUAGE,
         },
         baseline_result_tokens=TRACKER.count_tokens("".join(lines)),
     )
@@ -681,17 +911,14 @@ def read_note_section(filepath: str, heading: str, offset_lines: int = 0, max_li
 def write_note(filepath: str, content: str) -> str:
     """Creates or overwrites a Markdown note. Please use the 'note_format' prompt beforehand for the correct layout."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-        
-    target_file = (VAULT_PATH / filepath).resolve()
+    filepath, target_file = resolve_markdown_target(filepath)
     meta = {
         "filepath_ref": TRACKER.path_ref(filepath),
         "content_chars": len(content),
     }
     
     if not is_safe_path(filepath):
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "write_note",
             started_at,
@@ -700,12 +927,12 @@ def write_note(filepath: str, content: str) -> str:
             meta=meta,
         )
         
-    # Structural Security Check: Prevent the LLM from hallucinating new root-level folders.
+    # Only allow new notes inside existing top-level folders.
     path_parts = Path(filepath).parts
     if len(path_parts) > 1:
         top_level_folder = VAULT_PATH / path_parts[0]
         if not top_level_folder.exists():
-            return finalize_tracked_call(
+            return tracked_error(
                 "tool",
                 "write_note",
                 started_at,
@@ -714,7 +941,7 @@ def write_note(filepath: str, content: str) -> str:
                 meta=meta | {"top_level_folder": path_parts[0]},
             )
             
-    # Create folder structure if it doesn't exist (only allows sub-folders inside existing root folders now)
+    # Subfolders below an existing top-level folder are allowed.
     target_file.parent.mkdir(parents=True, exist_ok=True)
     
     with open(target_file, "w", encoding="utf-8") as f:
@@ -733,14 +960,11 @@ def write_note(filepath: str, content: str) -> str:
 def archive_note(filepath: str) -> str:
     """Moves a processed note from the Inbox or Clippings folder to the Archive folder to keep the workspace clean."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-        
-    source_file = (VAULT_PATH / filepath).resolve()
+    filepath, source_file = resolve_markdown_target(filepath)
     meta = {"filepath_ref": TRACKER.path_ref(filepath)}
     
     if not is_safe_path(filepath) or not source_file.exists():
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "archive_note",
             started_at,
@@ -749,10 +973,10 @@ def archive_note(filepath: str) -> str:
             meta=meta,
         )
         
-    # Security Check: Only allow archiving from Inbox or Clippings
+    # Restrict archiving to the expected intake folders.
     rel_path = os.path.relpath(source_file, VAULT_PATH)
     if not (rel_path.startswith("00_Inbox") or rel_path.startswith("Clippings")):
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "archive_note",
             started_at,
@@ -766,7 +990,7 @@ def archive_note(filepath: str) -> str:
     
     target_file = archive_dir / source_file.name
     
-    # Avoid overwriting if a file with the same name already exists in the archive
+    # Keep archived filenames unique without overwriting existing notes.
     counter = 1
     while target_file.exists():
         target_file = archive_dir / f"{source_file.stem}_{counter}.md"
@@ -798,30 +1022,21 @@ def find_stale_notes(days_old: int = 90) -> str:
                 file_path = os.path.join(root, name)
                 rel_path = os.path.relpath(file_path, VAULT_PATH)
                 
-                # Check parsed frontmatter 'updated:' or fallback to file mtime
                 last_updated = None
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    # simplistic frontmatter parse
-                    in_frontmatter = False
-                    for line in lines[:20]: # check top 20 lines
-                        if line.strip() == "---":
-                            if not in_frontmatter:
-                                in_frontmatter = True
-                            else:
-                                break
-                        elif in_frontmatter and line.startswith("updated:"):
-                            date_str = line.split("updated:")[1].strip()
-                            try:
-                                last_updated = datetime.strptime(date_str, "%Y-%m-%d")
-                            except ValueError:
-                                pass
+                        content = f.read()
+                    updated_value = extract_frontmatter(content).get("updated", "").strip().strip("'\"")
+                    if updated_value:
+                        try:
+                            last_updated = datetime.strptime(updated_value, "%Y-%m-%d")
+                        except ValueError:
+                            pass
                 except Exception:
                     pass
                 
                 if not last_updated:
-                    # fallback
+                    # Fall back to filesystem timestamps when frontmatter is missing.
                     try:
                         mtime = os.path.getmtime(file_path)
                         last_updated = datetime.fromtimestamp(mtime)
@@ -842,7 +1057,7 @@ def find_stale_notes(days_old: int = 90) -> str:
             meta={"days_old": days_old, "stale_count": 0},
         )
         
-    # Sort by oldest first
+    # Show the oldest notes first.
     stale_files.sort(key=lambda x: x[1], reverse=True)
     
     output = f"Found {len(stale_files)} notes older than {days_old} days:\n" 
@@ -872,7 +1087,7 @@ def note_format() -> str:
                 f"This is required so the system can verify information for depreciation later.\n"
                 f"CRITICAL INSTRUCTION 2: When updating an existing note via write_note, you MUST NOT delete the old information entirely. Instead, summarize the old state and add it to the '## Changelog / History' section, along with the date of the change, so historical knowledge is preserved.\n"
                 f"CRITICAL INSTRUCTION 3: You MUST structure the note semantically using H2 ('##') blocks for entirely new sections. This strict hierarchy allows the LLM to navigate the note via 'read_note_section' later without consuming massive token limits.\n\n"
-                f"CRITICAL INSTRUCTION 4: You MUST set the 'mcp_masking' frontmatter field thoughtfully. Use 'balanced' for most notes, 'clear' for purely technical code-heavy notes, and 'required' for clearly sensitive people, finance, or contract content.\n\n"
+                f"CRITICAL INSTRUCTION 4: You MUST set the 'mcp_masking' frontmatter field thoughtfully. Use 'balanced' for most notes, 'clear' for notes that should be returned unmasked, and 'required' for clearly sensitive people, finance, or contract content.\n\n"
                 f"CRITICAL INSTRUCTION 5: Prefer multiple small H3 subsections over large monolithic sections. If one subsection grows beyond roughly 20-30 lines, split it into another H3 with a precise title so retrieval stays token-efficient.\n\n"
                 f"Current Date for Frontmatter: {datetime.now().strftime('%Y-%m-%d')}"
             )
@@ -891,10 +1106,16 @@ def note_format() -> str:
             started_at,
             {},
             "Write the note in standard Markdown, starting with a YAML frontmatter. You MUST include original source URLs as references.",
+            status="error",
         )
 
 @mcp.tool()
-def get_token_usage_report(days: int = 30, include_prompts: bool = False, tool_name: str = "") -> str:
+def get_token_usage_report(
+    days: int = 30,
+    include_prompts: bool = False,
+    tool_name: str = "",
+    since_call_id: str = "",
+) -> str:
     """Returns a Markdown telemetry report summarizing token usage and estimated savings by MCP tool."""
     started_at = time.perf_counter()
     summary = TRACKER.summarize_records(
@@ -902,18 +1123,26 @@ def get_token_usage_report(days: int = 30, include_prompts: bool = False, tool_n
         include_prompts=include_prompts,
         name_filter=tool_name,
         exclude_names={"get_token_usage_report", "write_token_usage_report_note"},
+        since_call_id=since_call_id,
     )
     result = TRACKER.render_markdown_report(summary)
     return finalize_tracked_call(
         "tool",
         "get_token_usage_report",
         started_at,
-        {"days": days, "include_prompts": include_prompts, "tool_name": tool_name},
+        {
+            "days": days,
+            "include_prompts": include_prompts,
+            "tool_name": tool_name,
+            "since_call_id": since_call_id,
+        },
         result,
         meta={
             "report_record_count": summary["record_count"],
             "filtered_tool": tool_name or None,
             "include_prompts": include_prompts,
+            "since_call_id": since_call_id or None,
+            "since_call_id_found": summary["since_call_id_found"],
         },
     )
 
@@ -923,21 +1152,25 @@ def write_token_usage_report_note(
     days: int = 30,
     include_prompts: bool = False,
     tool_name: str = "",
+    since_call_id: str = "",
 ) -> str:
     """Writes a Markdown telemetry report into the vault so it can be viewed directly in Obsidian."""
     started_at = time.perf_counter()
-    if not filepath.endswith(".md"):
-        filepath += ".md"
-
-    target_file = (VAULT_PATH / filepath).resolve()
+    filepath, target_file = resolve_markdown_target(filepath)
     meta = {"filepath_ref": TRACKER.path_ref(filepath)}
 
     if not is_safe_path(filepath):
-        return finalize_tracked_call(
+        return tracked_error(
             "tool",
             "write_token_usage_report_note",
             started_at,
-            {"filepath": filepath, "days": days, "include_prompts": include_prompts, "tool_name": tool_name},
+            {
+                "filepath": filepath,
+                "days": days,
+                "include_prompts": include_prompts,
+                "tool_name": tool_name,
+                "since_call_id": since_call_id,
+            },
             f"Error: Invalid path '{filepath}'.",
             meta=meta,
         )
@@ -946,11 +1179,17 @@ def write_token_usage_report_note(
     if len(path_parts) > 1:
         top_level_folder = VAULT_PATH / path_parts[0]
         if not top_level_folder.exists():
-            return finalize_tracked_call(
+            return tracked_error(
                 "tool",
                 "write_token_usage_report_note",
                 started_at,
-                {"filepath": filepath, "days": days, "include_prompts": include_prompts, "tool_name": tool_name},
+                {
+                    "filepath": filepath,
+                    "days": days,
+                    "include_prompts": include_prompts,
+                    "tool_name": tool_name,
+                    "since_call_id": since_call_id,
+                },
                 f"Error: Structural policy prevents creating new root-level folders ('{path_parts[0]}'). Please place the report in an existing folder like '00_Inbox'.",
                 meta=meta | {"top_level_folder": path_parts[0]},
             )
@@ -960,6 +1199,7 @@ def write_token_usage_report_note(
         include_prompts=include_prompts,
         name_filter=tool_name,
         exclude_names={"get_token_usage_report", "write_token_usage_report_note"},
+        since_call_id=since_call_id,
     )
     report = TRACKER.render_markdown_report(summary)
 
@@ -971,12 +1211,20 @@ def write_token_usage_report_note(
         "tool",
         "write_token_usage_report_note",
         started_at,
-        {"filepath": filepath, "days": days, "include_prompts": include_prompts, "tool_name": tool_name},
+        {
+            "filepath": filepath,
+            "days": days,
+            "include_prompts": include_prompts,
+            "tool_name": tool_name,
+            "since_call_id": since_call_id,
+        },
         f"Telemetry report written to '{filepath}'.",
         meta=meta | {
             "report_record_count": summary["record_count"],
             "filtered_tool": tool_name or None,
             "include_prompts": include_prompts,
+            "since_call_id": since_call_id or None,
+            "since_call_id_found": summary["since_call_id_found"],
             "report_chars": len(report),
         },
     )

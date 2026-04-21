@@ -7,3 +7,7 @@ venv_13/
 
 .mcp-telemetry/
 *.jsonl
+
+# Local runtime configuration
+config.json
+privacy_rules.json
