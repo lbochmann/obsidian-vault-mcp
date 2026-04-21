@@ -1,9 +1,7 @@
 import hashlib
 import json
-import os
 import re
 import threading
-import time
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,23 +19,13 @@ class TokenTracker:
         log_path: Path,
         tokenizer_name: str,
         hash_filepaths: bool,
-        include_vault_stats: bool,
-        vault_stats_cache_ttl_seconds: int,
-        vault_path: Path | None,
-        ignored_folders: list[str] | None,
     ) -> None:
         self.enabled = enabled
         self.log_path = log_path
         self.tokenizer_name = tokenizer_name
         self.hash_filepaths = hash_filepaths
-        self.include_vault_stats = include_vault_stats
-        self.vault_stats_cache_ttl_seconds = max(vault_stats_cache_ttl_seconds, 0)
-        self.vault_path = vault_path
-        self.ignored_folders = set(ignored_folders or [])
         self._lock = threading.Lock()
         self._encoding = None
-        self._vault_snapshot_cache: dict[str, int] | None = None
-        self._vault_snapshot_cached_at = 0.0
 
         if self.enabled and tokenizer_name == "cl100k_base":
             try:
@@ -53,8 +41,6 @@ class TokenTracker:
         *,
         config: dict[str, Any],
         base_dir: Path,
-        vault_path: Path | None,
-        ignored_folders: list[str] | None,
     ) -> "TokenTracker":
         telemetry_config = config.get("telemetry", {})
         log_path = Path(telemetry_config.get("log_path", ".mcp-telemetry/tool_usage.jsonl"))
@@ -66,10 +52,6 @@ class TokenTracker:
             log_path=log_path,
             tokenizer_name=telemetry_config.get("tokenizer", "cl100k_base"),
             hash_filepaths=telemetry_config.get("hash_filepaths", True),
-            include_vault_stats=telemetry_config.get("include_vault_stats", True),
-            vault_stats_cache_ttl_seconds=telemetry_config.get("vault_stats_cache_ttl_seconds", 300),
-            vault_path=vault_path,
-            ignored_folders=ignored_folders,
         )
 
     def count_tokens(self, text: str) -> int:
@@ -90,39 +72,6 @@ class TokenTracker:
             return path_value
         digest = hashlib.sha256(path_value.encode("utf-8")).hexdigest()
         return digest[:16]
-
-    def _vault_snapshot(self) -> dict[str, int]:
-        """Return cached vault-size metrics so validation stays cheap between calls."""
-        if not self.include_vault_stats or not self.vault_path or not self.vault_path.exists():
-            return {}
-
-        if self.vault_stats_cache_ttl_seconds > 0:
-            age_seconds = time.monotonic() - self._vault_snapshot_cached_at
-            if self._vault_snapshot_cache is not None and age_seconds < self.vault_stats_cache_ttl_seconds:
-                return dict(self._vault_snapshot_cache)
-
-        note_count = 0
-        total_md_bytes = 0
-        for root, dirs, filenames in os.walk(self.vault_path):
-            dirs[:] = [d for d in dirs if d not in self.ignored_folders and not d.startswith(".")]
-            for name in filenames:
-                if not name.endswith(".md"):
-                    continue
-                note_count += 1
-                file_path = Path(root) / name
-                try:
-                    total_md_bytes += file_path.stat().st_size
-                except OSError:
-                    continue
-
-        snapshot = {
-            "vault_note_count": note_count,
-            "vault_total_md_bytes": total_md_bytes,
-        }
-        if self.vault_stats_cache_ttl_seconds > 0:
-            self._vault_snapshot_cache = snapshot
-            self._vault_snapshot_cached_at = time.monotonic()
-        return dict(snapshot)
 
     def log_call(
         self,
@@ -164,8 +113,6 @@ class TokenTracker:
 
         if meta:
             record["meta"] = meta
-
-        record.update(self._vault_snapshot())
 
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
@@ -245,8 +192,6 @@ class TokenTracker:
         last_ts: datetime | None = None
         first_call_id: str | None = None
         last_call_id: str | None = None
-        latest_vault_note_count: int | None = None
-        latest_vault_total_md_bytes: int | None = None
 
         for record in records:
             name = str(record.get("name", "unknown"))
@@ -272,9 +217,6 @@ class TokenTracker:
                 first_call_id = call_id
             if call_id:
                 last_call_id = call_id
-
-            latest_vault_note_count = record.get("vault_note_count", latest_vault_note_count)
-            latest_vault_total_md_bytes = record.get("vault_total_md_bytes", latest_vault_total_md_bytes)
 
             entry = by_name.setdefault(
                 name,
@@ -362,8 +304,6 @@ class TokenTracker:
             "last_ts": last_ts.isoformat() if last_ts else None,
             "first_call_id": first_call_id,
             "last_call_id": last_call_id,
-            "latest_vault_note_count": latest_vault_note_count,
-            "latest_vault_total_md_bytes": latest_vault_total_md_bytes,
             "totals": totals,
             "by_name": tool_rows,
         }
@@ -394,10 +334,6 @@ class TokenTracker:
             lines.append(f"- First call id in report: `{summary['first_call_id']}`")
         if summary.get("last_call_id"):
             lines.append(f"- Last call id in report: `{summary['last_call_id']}`")
-        if summary.get("latest_vault_note_count") is not None:
-            lines.append(f"- Vault notes: {summary['latest_vault_note_count']}")
-        if summary.get("latest_vault_total_md_bytes") is not None:
-            lines.append(f"- Vault markdown bytes: {summary['latest_vault_total_md_bytes']}")
 
         lines.extend(
             [

@@ -1,42 +1,47 @@
-import tempfile
 import unittest
+import json
+import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 from telemetry import TokenTracker
 
 
-class TokenTrackerCacheTests(unittest.TestCase):
-    def test_vault_snapshot_uses_cache_within_ttl(self):
+class TokenTrackerTests(unittest.TestCase):
+    def test_log_call_and_summary_capture_token_usage(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            vault_path = Path(tmp_dir)
-            (vault_path / "note.md").write_text("# Cached\nhello\n", encoding="utf-8")
+            base_path = Path(tmp_dir)
+            log_path = base_path / "tool_usage.jsonl"
 
             tracker = TokenTracker(
                 enabled=True,
-                log_path=vault_path / "tool_usage.jsonl",
+                log_path=log_path,
                 tokenizer_name="simple",
                 hash_filepaths=True,
-                include_vault_stats=True,
-                vault_stats_cache_ttl_seconds=300,
-                vault_path=vault_path,
-                ignored_folders=[],
             )
 
-            walk_calls = {"count": 0}
-            real_walk = __import__("os").walk
+            tracker.log_call(
+                kind="tool",
+                name="read_note_section",
+                args={"filepath": "foo.md"},
+                result="short result",
+                duration_ms=12.5,
+                baseline_result_tokens=25,
+            )
 
-            def counting_walk(*args, **kwargs):
-                walk_calls["count"] += 1
-                return real_walk(*args, **kwargs)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record["name"], "read_note_section")
+            self.assertEqual(record["status"], "ok")
+            self.assertIn("saved_result_tokens", record)
+            self.assertNotIn("vault_note_count", record)
+            self.assertNotIn("vault_total_md_bytes", record)
 
-            with patch("telemetry.os.walk", new=counting_walk):
-                first_snapshot = tracker._vault_snapshot()
-                second_snapshot = tracker._vault_snapshot()
-
-            self.assertEqual(first_snapshot, second_snapshot)
-            self.assertEqual(first_snapshot["vault_note_count"], 1)
-            self.assertEqual(walk_calls["count"], 1)
+            summary = tracker.summarize_records()
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(len(summary["by_name"]), 1)
+            self.assertEqual(summary["by_name"][0]["name"], "read_note_section")
+            self.assertGreaterEqual(summary["totals"]["saved_result_tokens"], 0)
 
 
 if __name__ == "__main__":

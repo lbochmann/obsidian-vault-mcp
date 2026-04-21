@@ -89,8 +89,6 @@ mcp = FastMCP("obsidian-vault-mcp")
 TRACKER = TokenTracker.from_config(
     config=config,
     base_dir=Path(__file__).parent,
-    vault_path=VAULT_PATH,
-    ignored_folders=IGNORED_FOLDERS,
 )
 
 

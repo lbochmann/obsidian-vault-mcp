@@ -15,8 +15,6 @@
     "enabled": false,
     "log_path": ".mcp-telemetry/tool_usage.jsonl",
     "tokenizer": "cl100k_base",
-    "hash_filepaths": true,
-    "include_vault_stats": true,
-    "vault_stats_cache_ttl_seconds": 300
+    "hash_filepaths": true
   }
 }

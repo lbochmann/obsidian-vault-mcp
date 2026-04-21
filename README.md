@@ -51,7 +51,6 @@ obsidian-vault-mcp
               - JSONL usage logs
               - token approximation
               - estimated savings
-              - cached vault stats
               - Markdown usage reports
         |
         v
@@ -104,9 +103,6 @@ Telemetry is optional and local-only. When enabled, it tracks:
 * total tool-call tokens
 * estimated saved result tokens versus naive full-note reads
 * latency
-* optional vault-size context
-
-Vault stats are cached with a TTL so validation remains possible without rescanning the whole vault on every call.
 
 ## Features
 
@@ -176,6 +172,14 @@ Example:
 
 Afterwards, fully quit Claude Desktop and restart it.
 
+### 5. Optional: Use the companion skill
+
+The repo also includes [`obsidian-analyst.md`](obsidian-analyst.md), a companion skill/prompt
+file for Claude or other MCP-capable assistants. It is optional, but it helps reinforce the
+intended retrieval order (`search_vault` -> `get_note_outline` -> `read_note_section` ->
+`read_note`), note-writing discipline, and privacy-warning behavior when working against this
+server.
+
 ## Configuration
 
 ### `config.example.json`
@@ -188,8 +192,6 @@ Key settings:
 * `ignored_folders`: folders excluded from listing and search
 * `privacy.nlp_language`: Presidio language, currently `de` or `en`
 * `telemetry.enabled`: toggle local JSONL usage tracking
-* `telemetry.include_vault_stats`: include cached vault-size metrics in telemetry
-* `telemetry.vault_stats_cache_ttl_seconds`: cache duration for vault metrics
 
 ### `privacy_rules.example.json`
 
@@ -237,6 +239,7 @@ Important caveats:
 ├── telemetry.py
 ├── setup_presidio.sh
 ├── config.example.json
+├── obsidian-analyst.md
 ├── privacy_rules.example.json
 ├── templates/
 │   └── note_template.md
@@ -257,7 +260,7 @@ The current smoke tests cover:
 
 * partial search scan failures without losing valid hits
 * telemetry error status on invalid paths
-* cached vault stats for telemetry
+* telemetry log and summary behavior
 * configured Presidio NLP language usage
 
 ## Example Usage
