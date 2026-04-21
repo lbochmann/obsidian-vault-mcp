@@ -1,4 +1,4 @@
-# Obsidian MCP Server for Claude Desktop
+# obsidian-vault-mcp
 
 A lightweight, local Model Context Protocol (MCP) server for Obsidian vaults.
 
@@ -27,7 +27,7 @@ This is not trying to be a generic RAG platform. It is trying to be a practical 
 Obsidian Vault (Markdown on disk)
         |
         v
-Obsidian MCP Server
+obsidian-vault-mcp
         |
         +-- Retrieval tools
         |     - search_vault
@@ -165,9 +165,9 @@ Example:
 {
   "mcpServers": {
     "obsidian": {
-      "command": "/Path/to/your/obsidian-mcp/venv/bin/python",
+      "command": "/Path/to/your/obsidian-vault-mcp/venv/bin/python",
       "args": [
-        "/Path/to/your/obsidian-mcp/server.py"
+        "/Path/to/your/obsidian-vault-mcp/server.py"
       ]
     }
   }

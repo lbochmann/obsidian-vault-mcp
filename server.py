@@ -85,7 +85,7 @@ def get_presidio_engines():
                     pass
     return ANALYZER_ENGINE, ANONYMIZER_ENGINE
 
-mcp = FastMCP("Obsidian Second Brain")
+mcp = FastMCP("obsidian-vault-mcp")
 TRACKER = TokenTracker.from_config(
     config=config,
     base_dir=Path(__file__).parent,
