@@ -4,5 +4,12 @@
     ".obsidian",
     ".git",
     ".trash"
-  ]
+  ],
+  "telemetry": {
+    "enabled": true,
+    "log_path": ".mcp-telemetry/tool_usage.jsonl",
+    "tokenizer": "cl100k_base",
+    "hash_filepaths": true,
+    "include_vault_stats": true
+  }
 }

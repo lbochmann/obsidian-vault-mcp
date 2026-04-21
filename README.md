@@ -1,72 +1,244 @@
 # Obsidian MCP Server for Claude Desktop
 
-A lightweight, local Model Context Protocol (MCP) Server for Obsidian vaults. This server was developed primarily for **Pragmatism and Privacy**.
+A lightweight, local Model Context Protocol (MCP) server for Obsidian vaults.
 
-It allows LLM clients like the Claude Desktop App to securely access personal notes, search through them, and create new, cleanly structured notes—without needing external vector databases or complex ML pipelines.
+This project is intentionally opinionated: local-first, inspectable, privacy-aware, and small enough that the architecture itself can serve as an Applied AI showcase.
+
+## Why Does This Project Exist?
+
+Most "AI for personal knowledge" setups drift toward one of two extremes:
+
+* **Heavy infrastructure:** embeddings, vector databases, sync layers, ingestion jobs, and operational overhead.
+* **Naive prompting:** dumping large documents into the model and paying for far more context than is actually useful.
+
+This project exists to explore a third path:
+
+* keep the source of truth as plain Markdown in an Obsidian vault
+* expose only a small set of deterministic tools to the model
+* optimize for privacy, retrieval quality, and token efficiency
+* make the system understandable enough that a human can reason about every layer
+
+In short: this is not trying to be a generic RAG platform. It is trying to be a practical, local document interface for real knowledge work.
+
+## Architecture At A Glance
+
+```text
+Obsidian Vault (Markdown on disk)
+        |
+        v
+Obsidian MCP Server (this project)
+        |
+        +-- Retrieval tools
+        |     - search_vault
+        |     - get_vault_structure
+        |     - get_note_outline
+        |     - read_note_section
+        |     - read_note
+        |
+        +-- Write / workflow tools
+        |     - write_note
+        |     - archive_note
+        |     - find_stale_notes
+        |
+        +-- Privacy layer
+        |     - regex masking
+        |     - optional Presidio NLP masking
+        |     - per-note masking strategy
+        |
+        +-- Telemetry layer
+              - JSONL tool usage logs
+              - token approximation
+              - savings estimates
+              - Markdown usage reports
+        |
+        v
+Claude Desktop / MCP-compatible client
+```
+
+### Design Flow
+
+1. Claude asks for the smallest useful context first.
+2. The server returns structured, bounded results instead of whole-document dumps.
+3. Privacy controls run locally before note content leaves the machine.
+4. Telemetry measures how much context was actually returned and how much likely got saved.
+
+## What The Server Is Optimized For
+
+### 1. Token-Efficient Retrieval
+
+Instead of loading full notes by default, the server encourages a staged retrieval flow:
+
+* `search_vault` searches note contents and filenames, with optional surrounding line context
+* `get_note_outline` reveals structure before content
+* `read_note_section` reads semantically from heading to heading
+* large sections can be paged with `offset_lines` and `max_lines`
+* `read_note` remains available as a fallback, not the default path
+
+This is basically "RAG light" built on top of deterministic Markdown structure rather than embeddings.
+
+### 2. Local Privacy Controls
+
+The privacy model is intentionally layered:
+
+* **Regex masking** runs globally and is best for domain-specific secrets such as internal IDs, API keys, or known sensitive patterns.
+* **Presidio NLP masking** is reserved for broader personal data such as names, addresses, phone numbers, or financial identifiers.
+
+To avoid damaging technical notes, the default `balanced` mode protects:
+
+* fenced code blocks
+* inline code
+* raw URLs
+
+from the Presidio NLP pass while still allowing regex redaction to run globally.
+
+### 3. Mixed-Vault Support
+
+Not every note should be treated the same way. A technical Bash note, a customer conversation, and an investment note have very different privacy and retrieval needs.
+
+Each note can declare its own strategy via frontmatter:
+
+```yaml
+mcp_masking: balanced
+```
+
+Available modes:
+
+* `required`: regex masking plus Presidio across the full note
+* `balanced`: regex masking globally, but code/URLs are protected from Presidio
+* `clear`: regex masking only, no Presidio
+
+Default behavior:
+
+* if a note has no `mcp_masking` field, the server falls back to `balanced`
+* the bundled MCP template defaults to `mcp_masking: balanced`
+
+### 4. Local Telemetry Instead of Guesswork
+
+The server can write local JSONL events for tool and prompt calls and estimate:
+
+* argument tokens
+* result tokens
+* total tool-call tokens
+* estimated "saved" tokens versus naive full-note reads
+* latency and vault-size context
+
+Claude can also read these reports back through MCP or write them into the vault as Markdown notes.
 
 ## Features
 
-- **No Vector Database Required:** A blazing fast, pure Python full-text search (`search_vault`) saves you configuration headaches and hosting costs.
-- **Semantic Token Optimization:** Instead of loading massive files that drain context limits, Claude can scan a note's structure (`get_note_outline`) and selectively read specific headings (`read_note_section`) to save up to 95% API tokens.
-- **Hybrid PII Masking:** Features a custom Two-Tier security filter. First, a fast Regex layer (`privacy_rules.json`) strips domain-specific secrets. Second, a deep NLP scanner via **Microsoft Presidio** strips global PII (Names, IBANs, Locations) before data reaches the LLM. 
-- **In-Band System Telemetry:** If the NLP layer fails to load, the server automatically injects a hidden warning prompt into the context, turning the LLM into an intelligent active error-handler that warns the user.
-- **Path Traversal Protection:** The LLM has limited write access constrained strictly to the defined Vault folder. Underlying system files remain protected.
-- **Inbox Zero (Safe Archiving):** The `archive_note` tool allows the LLM to automatically move processed clippings from your `00_Inbox` or `Clippings` folders to `08_Archive/Processed_Clippings`. No dangerous delete permissions, just a clean, reversible workflow.
-- **Formatting Prompts:** The server provides Claude with a fixed, strictly Markdown-hierarchical template (`templates/note_template.md`), aligning perfectly with Zettelkasten / Second Brain principles.
+* **No Vector Database Required:** pure Python retrieval over local Markdown files.
+* **Semantic Token Optimization:** outlines, section reads, and chunked retrieval reduce unnecessary context.
+* **Optional Token Telemetry:** local JSONL logging with approximate token counts and savings.
+* **Built-in Telemetry Reports:** usage reports can be rendered directly in Claude or written back into Obsidian.
+* **Hybrid PII Masking:** regex plus optional Presidio-based NLP masking.
+* **Code-Aware Privacy Filtering:** code fences, inline code, and URLs are protected from NLP over-masking in `balanced` mode.
+* **Per-Note Masking Strategies:** each note can opt into `required`, `balanced`, or `clear`.
+* **Path Traversal Protection:** reads and writes are constrained to the configured vault.
+* **Inbox Zero Workflow:** `archive_note` supports safe movement from inbox-style folders into archive storage.
+* **Formatting Prompt:** the server ships with a Markdown template optimized for structured, retrieval-friendly notes.
 
----
+## Writing For Retrieval
 
-## Installation & Setup (macOS / Linux)
+This server works best when notes are written as small semantic blocks instead of large monolithic sections.
 
-### Important: Why you MUST use Virtual Environments
-The most common source of installation issues is installing packages globally on macOS (especially with Python >= 3.11 or Homebrew). 
+Recommended style:
 
-> **Troubleshooting Syntax:** Commands like `python3 pip install -r requirements.txt` are syntactically incorrect and will fail with `can't open file '.../pip': No such file` because Python attempts to execute a file named "pip".
+* use clear H2 blocks for major topics
+* split large sections into focused H3 subsections
+* prefer multiple short code examples over one huge command dump
+* if one subsection grows beyond roughly 20-30 lines, split it further
 
-Even the correct command (`python3 -m pip install...`) is often blocked on modern Macs by `PEP-668` ("externally-managed-environment") to protect the OS.
+That is why the bundled MCP template nudges Claude toward smaller subheadings and cleaner thematic separation.
 
-**The Solution: Setup the server in an isolated Virtual Environment.**
+## Templates And Vault Structure
 
-### Step-by-step Installation
+There are two template concepts in this setup:
 
-1. **Open your terminal and navigate to the project folder:**
+* `templates/note_template.md` inside this repository is the MCP server's own authoring template, exposed through the `note_format` prompt
+* your Obsidian vault may also contain normal Markdown templates such as `_Templates/Knowledge-Note.md` or Templater-based files
+
+These do not technically conflict.
+
+The practical question is only whether vault templates should be visible to MCP tools:
+
+* if you want Claude to inspect or reuse vault templates, keep them accessible
+* if you want to hide them from search and listing, add `_Templates` to `ignored_folders` in `config.json`
+
+## Setup
+
+### Why You Should Use A Virtual Environment
+
+The most common installation issues on macOS come from global Python package installs, especially with newer Python/Homebrew setups.
+
+Commands like `python3 pip install -r requirements.txt` are invalid because Python tries to execute a file named `pip`. Even the correct form, `python3 -m pip install ...`, may run into `PEP-668` restrictions on system-managed environments.
+
+The clean solution is to run the server in its own virtual environment.
+
+### Installation
+
+1. Open a terminal and go to the project directory:
+
    ```bash
    cd /path/to/your/obsidian-mcp
    ```
 
-2. **Create the Virtual Environment (venv):**
+2. Create a virtual environment:
+
    ```bash
    python3 -m venv venv
    ```
 
-3. **Activate the Environment:**
+3. Activate it:
+
    ```bash
    source venv/bin/activate
    ```
 
-4. **Install the dependencies:**
+4. Install dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
 
-5. **Initialize Hybrid NLP (Microsoft Presidio):**
-   Run the setup script to download the SpaCy language models for advanced PII scanning.
+5. Initialize Presidio / SpaCy models:
+
    ```bash
    ./setup_presidio.sh
    ```
 
-5. **Configure the Server:**
-   Open `config.json` and adjust the `"vault_path"` to point to your actual Obsidian Vault folder. Customize your masking rules in `privacy_rules.json` if desired.
+6. Configure `config.json`:
 
----
+   * set `"vault_path"` to your actual Obsidian vault
+   * adjust `ignored_folders` as needed
+   * customize `privacy_rules.json` for your own regex redaction patterns
+
+### Optional: Enable Telemetry
+
+Telemetry is disabled by default and can be toggled in `config.json`:
+
+```json
+"telemetry": {
+  "enabled": true,
+  "log_path": ".mcp-telemetry/tool_usage.jsonl",
+  "tokenizer": "cl100k_base",
+  "hash_filepaths": true,
+  "include_vault_stats": true
+}
+```
+
+Notes:
+
+* `tokenizer: cl100k_base` uses `tiktoken` for a stronger local approximation
+* counts are still approximate and are not guaranteed to match Claude billing 1:1
+* telemetry is most useful for comparing strategies and trends, not for exact invoicing
 
 ## Claude Desktop Configuration
 
-Once the server is installed, you must tell Claude Desktop how to launch it.
-We edit the Claude Desktop Configuration block for this. On macOS, this file is located at:
+On macOS, edit:
+
 `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Insert the following block into your configuration. **Important:** As the command, we explicitly pass the path to the Python interpreter inside our generated `venv`. This ensures the script runs safely isolated.
+Add a server entry that points to the Python interpreter inside your virtual environment:
 
 ```json
 {
@@ -80,24 +252,24 @@ Insert the following block into your configuration. **Important:** As the comman
   }
 }
 ```
-*(Note: Replace `/Path/to/your/` with the actual absolute path to your project folder)*
 
-**Afterwards, quit the Claude Desktop App entirely (CMD+Q) and restart it.** 
-You should now see the small tool icon (hammer) in Claude's text input bar, confirming the server is actively connected.
+Replace `/Path/to/your/` with the real absolute path to your project.
 
----
+Afterwards, fully quit Claude Desktop and restart it.
 
-## How to use the server
+## Example Usage
 
-Try using prompts like these in Claude Desktop:
-* *"Search my vault for notes on Ransomware resilience."*
-* *"What files exist in the IT-Knowledge folder?"*
-* *"Read the file `mcp_test.md`."*
-* *"Summarize what I've read and create a new note for it in the vault. Make sure to fetch the format rules for notes beforehand!"*
+Try prompts like:
 
----
+* *"Search my vault for notes on ransomware resilience."*
+* *"Search for `hardening` and include a few surrounding lines for each hit."*
+* *"Show me the outline of `Linux Kompendium` before reading it."*
+* *"Read the section `Praxis / Kommandos` from this note."*
+* *"Continue that section with the next chunk."*
+* *"Create a new technical knowledge note and choose an appropriate `mcp_masking` mode."*
+* *"Show me the MCP token usage report for the last 30 days."*
+* *"Write the telemetry report into `00_Inbox/MCP Tool Usage Report.md`."*
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
-You are free to use, copy, modify, and distribute this software for any purpose, including commercial use.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
