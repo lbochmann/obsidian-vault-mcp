@@ -1,8 +1,12 @@
 # obsidian-vault-mcp
 
-A lightweight, local Model Context Protocol (MCP) server for Obsidian vaults.
+Local-first, privacy-aware MCP for Obsidian vaults.
 
-This project is intentionally opinionated: local-first, inspectable, privacy-aware, and small enough that a reviewer can understand the entire system quickly.
+A lightweight Model Context Protocol (MCP) server that lets assistants work against plain
+Markdown notes without defaulting to embeddings, vector databases, or whole-document dumps.
+
+This project is intentionally opinionated: inspectable, local-only, token-aware, and small
+enough that a reviewer can understand the entire system quickly.
 
 ## Why This Exists
 
