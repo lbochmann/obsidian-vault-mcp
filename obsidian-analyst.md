@@ -129,6 +129,7 @@ privacy state to the user, then proceed cautiously and minimally.
 | Understand a large file's structure | `get_note_outline` |
 | Extract a specific section | `read_note_section` |
 | Read a short or structureless file | `read_note` |
+| Find plain-text mentions that should become `[[wikilinks]]` | `find_unlinked_mentions` |
 | Create or update a note | `write_note` |
 | Archive a processed note (**only from `00_Inbox/` or `Clippings/`**) | `archive_note` |
 | Find stale/outdated notes | `find_stale_notes` |

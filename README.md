@@ -39,6 +39,7 @@ obsidian-vault-mcp
         |     - get_note_outline
         |     - read_note_section
         |     - read_note
+        |     - find_unlinked_mentions
         |
         +-- Write / workflow tools
         |     - write_note
@@ -80,6 +81,7 @@ Instead of treating the vault like a bag of full documents, the server encourage
 * `get_note_outline` exposes structure before content
 * `read_note_section` reads semantically from heading to heading and supports pagination
 * `read_note` remains available as a fallback, not the default
+* `find_unlinked_mentions` surfaces plain-text references to existing note titles that are not yet `[[wikilinks]]`
 
 This is effectively "RAG light" built on deterministic Markdown structure rather than embeddings.
 
@@ -113,6 +115,7 @@ Telemetry is optional and local-only. When enabled, it tracks:
 * Pure Python retrieval over local Markdown files
 * Structured search results instead of whole-document dumps
 * Outline-first and section-level reads for large notes
+* Deterministic cross-link discovery for note curation
 * Optional local telemetry with token estimates and savings reports
 * Regex plus optional Presidio-based masking
 * Per-note masking strategies via frontmatter
@@ -176,13 +179,15 @@ Example:
 
 Afterwards, fully quit Claude Desktop and restart it.
 
-### 5. Optional: Use the companion skill
+### 5. Optional: Use the companion skills
 
-The repo also includes [`obsidian-analyst.md`](obsidian-analyst.md), a companion skill/prompt
-file for Claude or other MCP-capable assistants. It is optional, but it helps reinforce the
-intended retrieval order (`search_vault` -> `get_note_outline` -> `read_note_section` ->
-`read_note`), note-writing discipline, and privacy-warning behavior when working against this
-server.
+The repo also includes two optional skill/prompt files for Claude or other MCP-capable assistants:
+
+* [`obsidian-analyst.md`](obsidian-analyst.md) reinforces the intended retrieval order
+  (`search_vault` -> `get_note_outline` -> `read_note_section` -> `read_note`),
+  note-writing discipline, and privacy-warning behavior.
+* [`research-enrich.md`](research-enrich.md) extends that workflow with source-first external
+  research, cross-link discovery, and conservative enrichment rules for updating notes.
 
 ## Configuration
 
@@ -244,6 +249,7 @@ Important caveats:
 ├── setup_presidio.sh
 ├── config.example.json
 ├── obsidian-analyst.md
+├── research-enrich.md
 ├── privacy_rules.example.json
 ├── templates/
 │   └── note_template.md

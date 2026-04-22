@@ -13,8 +13,10 @@ PROTECTED_SEGMENT_TOKEN = "__MCP_PROTECTED_SEGMENT_"
 FENCED_CODE_BLOCK_PATTERN = re.compile(r"(^|\n)(```|~~~)[^\n]*\n.*?\n\2(?=\n|$)", re.DOTALL)
 INLINE_CODE_PATTERN = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
+WIKILINK_PATTERN = re.compile(r"\[\[[^\]]+\]\]")
 VALID_MASKING_MODES = {"required", "balanced", "clear"}
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+FENCE_TOGGLE_PATTERN = re.compile(r"^\s*(```|~~~)")
 SUPPORTED_PRESIDIO_LANGUAGES = {
     "de": "de_core_news_lg",
     "en": "en_core_web_lg",
@@ -266,6 +268,67 @@ def build_search_snippet(lines: list[str], match_index: int, context_lines: int)
 def normalize_filepath_filter(filepath_filter: str) -> str:
     normalized = filepath_filter.strip().replace("\\", "/").lstrip("/")
     return normalized
+
+
+def sanitize_line_for_unlinked_mentions(line: str) -> str:
+    sanitized = WIKILINK_PATTERN.sub(" ", line)
+    sanitized = INLINE_CODE_PATTERN.sub(" ", sanitized)
+    return sanitized
+
+
+def build_note_title_pattern(title: str) -> re.Pattern[str]:
+    escaped_title = re.escape(title)
+    return re.compile(rf"(?<!\w){escaped_title}(?!\w)", re.IGNORECASE)
+
+
+def is_meaningful_note_title(title: str, min_term_length: int) -> bool:
+    compact_title = re.sub(r"[\W_]+", "", title.casefold())
+    return len(compact_title) >= min_term_length
+
+
+def collect_note_title_candidates(min_term_length: int) -> list[dict]:
+    candidates_by_key: dict[str, dict] = {}
+
+    for root, dirs, filenames in os.walk(VAULT_PATH):
+        dirs[:] = [d for d in dirs if d not in IGNORED_FOLDERS and not d.startswith('.')]
+
+        for name in filenames:
+            if not name.endswith(".md"):
+                continue
+
+            rel_path = os.path.relpath(os.path.join(root, name), VAULT_PATH)
+            title = Path(name).stem.strip()
+            normalized_title = normalize_search_text(title)
+            if not normalized_title or not is_meaningful_note_title(title, min_term_length):
+                continue
+
+            entry = candidates_by_key.setdefault(
+                normalized_title,
+                {
+                    "title": title,
+                    "normalized_title": normalized_title,
+                    "paths": [],
+                },
+            )
+            entry["title"] = min(entry["title"], title, key=lambda value: (len(value), value.casefold(), value))
+            entry["paths"].append(rel_path)
+
+    candidates = []
+    for key in sorted(candidates_by_key):
+        entry = candidates_by_key[key]
+        paths = sorted(set(entry["paths"]))
+        title = entry["title"]
+        candidates.append(
+            {
+                "title": title,
+                "normalized_title": key,
+                "paths": paths,
+                "pattern": build_note_title_pattern(title),
+            }
+        )
+
+    candidates.sort(key=lambda entry: (-len(entry["title"]), entry["title"].casefold(), entry["title"]))
+    return candidates
 
 
 def collect_available_headings(lines: list[str]) -> list[str]:
@@ -1069,6 +1132,154 @@ def find_stale_notes(days_old: int = 90) -> str:
         {"days_old": days_old},
         output,
         meta={"days_old": days_old, "stale_count": len(stale_files)},
+    )
+
+@mcp.tool()
+def find_unlinked_mentions(
+    filepath_filter: str = "",
+    min_term_length: int = 3,
+    max_results: int = 50,
+) -> str:
+    """Finds plain-text mentions of existing note titles that are not yet written as [[wikilinks]]."""
+    started_at = time.perf_counter()
+    normalized_min_term_length = max(min_term_length, 1)
+    normalized_max_results = max(max_results, 0)
+    filepath_filter_normalized = normalize_filepath_filter(filepath_filter)
+    filepath_filter_lower = filepath_filter_normalized.lower()
+    candidate_entries = collect_note_title_candidates(min_term_length=normalized_min_term_length)
+    results = []
+    matched_file_count = 0
+    scanned_file_count = 0
+    scan_errors = []
+    scan_error_count = 0
+    max_scan_errors = 5
+
+    for root, dirs, filenames in os.walk(VAULT_PATH):
+        dirs[:] = [d for d in dirs if d not in IGNORED_FOLDERS and not d.startswith('.')]
+
+        for name in filenames:
+            if not name.endswith(".md"):
+                continue
+
+            file_path = os.path.join(root, name)
+            rel_path = os.path.relpath(file_path, VAULT_PATH)
+            rel_path_lower = rel_path.lower()
+
+            if filepath_filter_lower and not rel_path_lower.startswith(filepath_filter_lower):
+                continue
+
+            scanned_file_count += 1
+            current_title_normalized = normalize_search_text(Path(rel_path).stem)
+            file_results = []
+            in_frontmatter = False
+            frontmatter_checked = False
+            in_fenced_block = False
+
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line_number, line in enumerate(f, start=1):
+                        stripped_line = line.strip()
+
+                        if not frontmatter_checked:
+                            frontmatter_checked = True
+                            if stripped_line == "---":
+                                in_frontmatter = True
+                                continue
+
+                        if in_frontmatter:
+                            if stripped_line == "---":
+                                in_frontmatter = False
+                            continue
+
+                        if FENCE_TOGGLE_PATTERN.match(line):
+                            in_fenced_block = not in_fenced_block
+                            continue
+
+                        if in_fenced_block:
+                            continue
+
+                        sanitized_line = sanitize_line_for_unlinked_mentions(line)
+                        if not sanitized_line.strip():
+                            continue
+
+                        occupied_ranges: list[tuple[int, int]] = []
+                        for entry in candidate_entries:
+                            if entry["normalized_title"] == current_title_normalized:
+                                continue
+
+                            matches = list(entry["pattern"].finditer(sanitized_line))
+                            if not matches:
+                                continue
+
+                            for match in matches:
+                                start, end = match.span()
+                                if any(start < existing_end and end > existing_start for existing_start, existing_end in occupied_ranges):
+                                    continue
+
+                                occupied_ranges.append((start, end))
+                                file_results.append(
+                                    {
+                                        "file": rel_path,
+                                        "line": line_number,
+                                        "mention_text": match.group(0),
+                                        "note_title": entry["title"],
+                                        "target_paths": entry["paths"],
+                                        "ambiguous_target": len(entry["paths"]) > 1,
+                                        "snippet_markdown": apply_masking(line.strip()),
+                                    }
+                                )
+                                break
+            except Exception as exc:
+                scan_error_count += 1
+                if len(scan_errors) < max_scan_errors:
+                    scan_errors.append(
+                        {
+                            "file": rel_path,
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                continue
+
+            if file_results:
+                matched_file_count += 1
+                results.extend(file_results)
+
+    truncated_results = results[:normalized_max_results]
+    response_payload = {
+        "ok": True,
+        "filepath_filter": filepath_filter_normalized or None,
+        "min_term_length": normalized_min_term_length,
+        "scanned_file_count": scanned_file_count,
+        "candidate_note_count": len(candidate_entries),
+        "matched_file_count": matched_file_count,
+        "result_count": len(truncated_results),
+        "total_result_count": len(results),
+        "results_truncated": len(results) > len(truncated_results),
+        "scan_error_count": scan_error_count,
+        "scan_errors_truncated": scan_error_count > len(scan_errors),
+        "scan_errors": scan_errors,
+        "results": truncated_results,
+    }
+    return finalize_tracked_call(
+        "tool",
+        "find_unlinked_mentions",
+        started_at,
+        {
+            "filepath_filter": filepath_filter,
+            "min_term_length": min_term_length,
+            "max_results": max_results,
+        },
+        response_payload,
+        meta={
+            "filepath_filter": filepath_filter_normalized or None,
+            "min_term_length": normalized_min_term_length,
+            "max_results": normalized_max_results,
+            "candidate_note_count": len(candidate_entries),
+            "matched_file_count": matched_file_count,
+            "match_count": len(results),
+            "scanned_file_count": scanned_file_count,
+            "scan_error_count": scan_error_count,
+        },
     )
 
 @mcp.prompt()

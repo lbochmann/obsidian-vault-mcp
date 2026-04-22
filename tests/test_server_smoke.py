@@ -120,6 +120,37 @@ class SearchAndTelemetryTests(unittest.TestCase):
             self.assertIn("dated-note.md", response)
             self.assertIn("2020-01-01", response)
 
+    def test_find_unlinked_mentions_ignores_frontmatter_code_and_existing_wikilinks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            (vault_path / "Alpha Project.md").write_text("# Alpha Project\n", encoding="utf-8")
+            (vault_path / "Linked Thing.md").write_text("# Linked Thing\n", encoding="utf-8")
+            (vault_path / "Journal.md").write_text(
+                "---\n"
+                "title: Alpha Project\n"
+                "---\n\n"
+                "We should connect Alpha Project to the roadmap.\n"
+                "This one is already linked: [[Linked Thing]].\n"
+                "`Alpha Project` should stay ignored in inline code.\n"
+                "```\n"
+                "Alpha Project inside a code fence.\n"
+                "```\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path), \
+                 patch.object(server, "IGNORED_FOLDERS", []):
+                response = json.loads(server.find_unlinked_mentions())
+
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["matched_file_count"], 1)
+            self.assertEqual(response["total_result_count"], 1)
+            self.assertEqual(response["results"][0]["file"], "Journal.md")
+            self.assertEqual(response["results"][0]["note_title"], "Alpha Project")
+            self.assertEqual(response["results"][0]["target_paths"], ["Alpha Project.md"])
+
 
 class PresidioLanguageTests(unittest.TestCase):
     def test_apply_deep_masking_uses_configured_language(self):
