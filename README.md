@@ -279,6 +279,13 @@ Important caveats:
 ├── LICENSE
 ├── requirements.txt
 ├── server.py
+├── obsidian_mcp/
+│   ├── config.py
+│   ├── markdown.py
+│   ├── privacy.py
+│   ├── tool_runtime.py
+│   ├── vault.py
+│   └── wikilinks.py
 ├── telemetry.py
 ├── setup_presidio.sh
 ├── config.example.json
@@ -291,6 +298,16 @@ Important caveats:
     ├── test_server_smoke.py
     └── test_telemetry.py
 ```
+
+`server.py` is intentionally kept as the MCP entrypoint and tool orchestration layer.
+Reusable behavior lives in the `obsidian_mcp/` package:
+
+* `markdown.py`: headings, sections, frontmatter, and Markdown insertion helpers
+* `vault.py`: safe path handling, file reads/writes, Markdown file iteration, filepath filters
+* `wikilinks.py`: backlink parsing, unlinked mention helpers, wikilink rewrite logic
+* `privacy.py`: regex masking, Presidio masking, and note masking modes
+* `tool_runtime.py`: tool result serialization and telemetry wrapping
+* `config.py`: runtime config loading and derived settings
 
 ## Smoke Tests
 
@@ -306,6 +323,7 @@ The current smoke tests cover:
 * telemetry error status on invalid paths
 * telemetry log and summary behavior
 * configured Presidio NLP language usage
+* surgical note edits, frontmatter updates, backlink lookup, and note moves
 
 ## Example Usage
 
