@@ -148,12 +148,13 @@ This gives the user an at-a-glance quality indicator and makes future audits eas
 
 #### Preservation Rule
 
-Never modify existing content. Always append to the note:
+Never rewrite the full note for enrichment. Use surgical tools:
 
-1. The enrichment block (new `##` section or additions to an existing one).
-2. An updated `## Sources` section (append to existing or create new).
-3. A `## Research Gaps` section if any claims could not be sourced.
-4. An updated `## Changelog / History` entry per the obsidian-analyst protocol.
+1. Add the enrichment block with `insert_after_heading` when it belongs in an existing section, or `append_to_note` for a new `##` section.
+2. Update `## Sources` with `insert_after_heading`; use `read_note_section` first if you need to merge with existing source numbering.
+3. Add or update `## Research Gaps` with `insert_after_heading` or `replace_section` only after reading that section.
+4. Add a `## Changelog / History` entry with `insert_after_heading` or `append_to_note`.
+5. Update YAML metadata such as `updated` with `update_frontmatter`.
 
 ---
 
@@ -184,7 +185,7 @@ The following are hard stops. Do not proceed past them without user confirmation
   research gap with the note: "Believed to be X — source required."
 - **No snippet-as-source.** A search result snippet does not constitute verification.
   Fetch the page; confirm the claim is present.
-- **No silent overwriting.** Never replace existing content — only append.
+- **No silent overwriting.** Never replace existing content without first reading the exact section and using `replace_section` intentionally.
 - **No stub auto-creation.** Suggest stubs; never create them unilaterally.
 - **No bulk rewrites.** Enrichment adds to a note; it does not restructure it. If a
   structural rewrite is needed, surface that recommendation and wait for user approval.
@@ -217,8 +218,8 @@ This keeps the user informed without requiring them to read the full note diff.
 | 1 — Vault Orientation | `search_vault`, `get_note_outline`, `read_note_section` | Read existing note |
 | 2 — Gap Analysis | (internal reasoning) | Identify what's missing |
 | 3 — External Research | `web_search`, `web_fetch` | Verify claims against live sources |
-| 4 — Cross-Link Discovery | `find_unlinked_mentions`, `search_vault` | Find linkable vault notes |
-| 5 — Write Enrichment | `write_note` | Append verified content only |
+| 4 — Cross-Link Discovery | `find_unlinked_mentions`, `find_backlinks`, `search_vault` | Find linkable vault notes |
+| 5 — Write Enrichment | `append_to_note`, `insert_after_heading`, `replace_section`, `update_frontmatter` | Append or edit only targeted sections |
 
 ---
 

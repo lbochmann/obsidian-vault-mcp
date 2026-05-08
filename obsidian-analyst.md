@@ -56,7 +56,7 @@ was insufficient.
  
 ---
  
-## Note Writing Protocol (`write_note`)
+## Note Writing Protocol (Surgical Updates First)
  
 Whenever you create or update a note, you **must** follow these rules:
  
@@ -70,9 +70,12 @@ Whenever you create or update a note, you **must** follow these rules:
 - Override only if the user explicitly specifies otherwise.
 - Keep YAML frontmatter, tags, and headings in English regardless.
 ### Preservation Rule — Never Destroy History
-- **Never overwrite** content in existing files.
+- **Never overwrite** content in existing files unless the user explicitly requests full replacement.
+- For new notes, use `write_note(..., mode="create_only")`.
+- For existing notes, prefer `append_to_note`, `insert_after_heading`, `replace_section`, and `update_frontmatter`.
+- Use `read_note_section` before `replace_section` when preserving or merging existing section content matters.
 - Always append new information to a `## Changelog / History` section at the bottom.
-- If that section doesn't exist yet, create it before appending.
+- If that section doesn't exist yet, create it with `insert_after_heading` or `append_to_note` before appending.
 ### Example note structure
 ```markdown
 ---
@@ -129,8 +132,14 @@ privacy state to the user, then proceed cautiously and minimally.
 | Understand a large file's structure | `get_note_outline` |
 | Extract a specific section | `read_note_section` |
 | Read a short or structureless file | `read_note` |
+| Append to an existing note | `append_to_note` |
+| Insert into a specific Markdown section | `insert_after_heading` |
+| Replace one known section | `replace_section` |
+| Update YAML metadata only | `update_frontmatter` |
+| Find real wikilinks to a note | `find_backlinks` |
 | Find plain-text mentions that should become `[[wikilinks]]` | `find_unlinked_mentions` |
-| Create or update a note | `write_note` |
+| Create a new note safely | `write_note(..., mode="create_only")` |
+| Rename or move a note | `move_note` |
 | Archive a processed note (**only from `00_Inbox/` or `Clippings/`**) | `archive_note` |
 | Find stale/outdated notes | `find_stale_notes` |
 | List files in a folder | `list_notes` |

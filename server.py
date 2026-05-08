@@ -3,6 +3,7 @@ import shutil
 import json
 import re
 import time
+from fnmatch import fnmatch
 from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,11 @@ FENCED_CODE_BLOCK_PATTERN = re.compile(r"(^|\n)(```|~~~)[^\n]*\n.*?\n\2(?=\n|$)"
 INLINE_CODE_PATTERN = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
 WIKILINK_PATTERN = re.compile(r"\[\[[^\]]+\]\]")
+WIKILINK_CAPTURE_PATTERN = re.compile(r"\[\[([^\]]+)\]\]")
 VALID_MASKING_MODES = {"required", "balanced", "clear"}
+VALID_WRITE_MODES = {"overwrite", "create_only", "append"}
+VALID_FILEPATH_FILTER_MODES = {"prefix", "substring", "glob"}
+VALID_INSERT_PLACEMENTS = {"end_of_section", "after_heading"}
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 FENCE_TOGGLE_PATTERN = re.compile(r"^\s*(```|~~~)")
 SUPPORTED_PRESIDIO_LANGUAGES = {
@@ -150,8 +155,9 @@ def tracked_error(
 
 def is_safe_path(requested_path: str) -> bool:
     """Prevents Path Traversal outside the vault."""
-    target_path = (VAULT_PATH / requested_path).resolve()
-    return target_path.is_relative_to(VAULT_PATH)
+    vault_root = VAULT_PATH.resolve()
+    target_path = (vault_root / requested_path).resolve()
+    return target_path.is_relative_to(vault_root)
 
 def normalize_markdown_filepath(filepath: str) -> str:
     """Ensure note-oriented tools consistently operate on Markdown file paths."""
@@ -167,6 +173,73 @@ def resolve_markdown_target(filepath: str) -> tuple[str, Path]:
     """Normalize a note path and resolve it inside the configured vault."""
     normalized_filepath = normalize_markdown_filepath(filepath)
     return normalized_filepath, resolve_vault_target(normalized_filepath)
+
+
+def validate_markdown_write_target(filepath: str, target_file: Path) -> str | None:
+    """Return an error string when a Markdown write would violate vault policy."""
+    if not is_safe_path(filepath):
+        return f"Error: Invalid path '{filepath}'."
+
+    path_parts = Path(filepath).parts
+    if len(path_parts) > 1:
+        top_level_folder = VAULT_PATH / path_parts[0]
+        if not top_level_folder.exists():
+            return (
+                f"Error: Structural policy prevents creating new root-level folders ('{path_parts[0]}'). "
+                "Please place the note in an existing folder like '00_Inbox'. Use 'list_notes' or "
+                "'search_vault' to find the correct directory."
+            )
+
+    if not target_file.resolve().is_relative_to(VAULT_PATH.resolve()):
+        return f"Error: Invalid path '{filepath}'."
+
+    return None
+
+
+def read_text_file(path: Path) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def append_markdown_block(existing_content: str, content: str) -> str:
+    """Append a Markdown block with predictable spacing and a final newline."""
+    block = content.strip("\n")
+    if not block:
+        return existing_content
+
+    separator = ""
+    if existing_content:
+        if not existing_content.endswith("\n"):
+            separator = "\n\n"
+        elif not existing_content.endswith("\n\n"):
+            separator = "\n"
+
+    return f"{existing_content}{separator}{block}\n"
+
+
+def join_markdown_parts(before: str, content: str, after: str) -> str:
+    """Insert or replace a Markdown block while keeping neighboring sections readable."""
+    block = content.strip("\n")
+    if not block:
+        return before + after
+
+    if before and not before.endswith("\n"):
+        before += "\n"
+    if before and not before.endswith("\n\n"):
+        before += "\n"
+
+    result = before + block
+    if not result.endswith("\n"):
+        result += "\n"
+    if after and not result.endswith("\n\n"):
+        result += "\n"
+    return result + after
 
 def apply_masking(text: str) -> str:
     """Applies Regex filters to mask personally identifiable information before passing it to the LLM."""
@@ -270,6 +343,20 @@ def normalize_filepath_filter(filepath_filter: str) -> str:
     return normalized
 
 
+def filepath_matches_filter(rel_path: str, filepath_filter: str, filter_mode: str) -> bool:
+    if not filepath_filter:
+        return True
+
+    rel_path_lower = rel_path.replace("\\", "/").lower()
+    filepath_filter_lower = filepath_filter.lower()
+
+    if filter_mode == "substring":
+        return filepath_filter_lower in rel_path_lower
+    if filter_mode == "glob":
+        return fnmatch(rel_path_lower, filepath_filter_lower)
+    return rel_path_lower.startswith(filepath_filter_lower)
+
+
 def sanitize_line_for_unlinked_mentions(line: str) -> str:
     sanitized = WIKILINK_PATTERN.sub(" ", line)
     sanitized = INLINE_CODE_PATTERN.sub(" ", sanitized)
@@ -331,6 +418,75 @@ def collect_note_title_candidates(min_term_length: int) -> list[dict]:
     return candidates
 
 
+def normalize_wikilink_target(target: str) -> str:
+    link_target = target.split("|", 1)[0].split("#", 1)[0].strip().replace("\\", "/").lstrip("/")
+    if link_target.endswith(".md"):
+        link_target = link_target[:-3]
+    return normalize_search_text(link_target)
+
+
+def wikilink_aliases_for_path(filepath: str) -> set[str]:
+    normalized = normalize_markdown_filepath(filepath).replace("\\", "/").lstrip("/")
+    no_extension = normalized[:-3] if normalized.endswith(".md") else normalized
+    stem = Path(no_extension).name
+    return {
+        normalize_wikilink_target(no_extension),
+        normalize_wikilink_target(stem),
+    }
+
+
+def resolve_backlink_aliases(filepath_or_title: str) -> set[str]:
+    normalized_input = filepath_or_title.strip().replace("\\", "/").lstrip("/")
+    if not normalized_input:
+        return set()
+
+    path_like = normalized_input.endswith(".md") or "/" in normalized_input
+    if path_like:
+        return wikilink_aliases_for_path(normalized_input)
+
+    aliases = {normalize_wikilink_target(normalized_input)}
+    candidate_path = normalize_markdown_filepath(normalized_input)
+    candidate_file = resolve_vault_target(candidate_path)
+    if candidate_file.exists():
+        aliases.update(wikilink_aliases_for_path(candidate_path))
+    return aliases
+
+
+def iter_markdown_files() -> list[tuple[str, Path]]:
+    files = []
+    for root, dirs, filenames in os.walk(VAULT_PATH):
+        dirs[:] = [d for d in dirs if d not in IGNORED_FOLDERS and not d.startswith('.')]
+        for name in filenames:
+            if name.endswith(".md"):
+                file_path = Path(root) / name
+                rel_path = os.path.relpath(file_path, VAULT_PATH)
+                files.append((rel_path, file_path))
+    return files
+
+
+def build_wikilink_replacement(match: re.Match[str], old_aliases: set[str], new_filepath: str) -> str:
+    raw_inner = match.group(1)
+    target_and_heading, alias = (raw_inner.split("|", 1) + [""])[:2] if "|" in raw_inner else (raw_inner, "")
+    target, heading = (target_and_heading.split("#", 1) + [""])[:2] if "#" in target_and_heading else (target_and_heading, "")
+
+    if normalize_wikilink_target(target) not in old_aliases:
+        return match.group(0)
+
+    new_no_extension = normalize_markdown_filepath(new_filepath).replace("\\", "/").lstrip("/")
+    if new_no_extension.endswith(".md"):
+        new_no_extension = new_no_extension[:-3]
+
+    old_target_normalized = normalize_wikilink_target(target)
+    new_stem = Path(new_no_extension).name
+    replacement_target = new_stem if old_target_normalized == normalize_wikilink_target(Path(target).name) and "/" not in target else new_no_extension
+
+    if heading:
+        replacement_target += f"#{heading}"
+    if alias:
+        replacement_target += f"|{alias}"
+    return f"[[{replacement_target}]]"
+
+
 def collect_available_headings(lines: list[str]) -> list[str]:
     headings = []
     for line in lines:
@@ -375,6 +531,144 @@ def find_best_heading_match(
             best_score = score
 
     return best_index, best_level, best_line, min(best_score, 1.0)
+
+
+def section_end_index(lines: list[str], start_index: int, matched_level: int) -> int:
+    for idx in range(start_index + 1, len(lines)):
+        parsed_heading = parse_markdown_heading(lines[idx])
+        if parsed_heading:
+            current_level, _ = parsed_heading
+            if current_level <= matched_level:
+                return idx
+    return len(lines)
+
+
+def find_section_bounds(
+    lines: list[str],
+    heading: str,
+    *,
+    heading_fuzzy: bool = False,
+) -> dict:
+    requested_level, target_heading = parse_heading_query(heading)
+    available_headings = collect_available_headings(lines)
+
+    if not target_heading:
+        return {
+            "ok": False,
+            "error": "Provided heading is empty.",
+            "available_headings": available_headings,
+        }
+
+    exact_matches = []
+    for idx, line in enumerate(lines):
+        parsed_heading = parse_markdown_heading(line)
+        if not parsed_heading:
+            continue
+
+        current_level, current_title = parsed_heading
+        current_heading = normalize_search_text(current_title)
+        if current_heading == target_heading and (requested_level is None or current_level == requested_level):
+            exact_matches.append((idx, current_level, line))
+
+    if len(exact_matches) > 1:
+        return {
+            "ok": False,
+            "error": f"Heading '{heading}' matched {len(exact_matches)} sections. Include the heading level or rename duplicates before editing.",
+            "available_headings": available_headings[:20],
+            "available_heading_count": len(available_headings),
+            "available_headings_truncated": len(available_headings) > 20,
+        }
+
+    if exact_matches:
+        start_index, matched_level, heading_line = exact_matches[0]
+        return {
+            "ok": True,
+            "start": start_index,
+            "end": section_end_index(lines, start_index, matched_level),
+            "heading_level": matched_level,
+            "resolved_heading": heading_line.strip(),
+            "match_strategy": "exact",
+            "match_confidence": 1.0,
+        }
+
+    if heading_fuzzy:
+        best_index, best_level, best_line, best_score = find_best_heading_match(lines, target_heading, requested_level)
+        if best_index is not None and best_level is not None and best_line is not None and best_score >= 0.72:
+            return {
+                "ok": True,
+                "start": best_index,
+                "end": section_end_index(lines, best_index, best_level),
+                "heading_level": best_level,
+                "resolved_heading": best_line.strip(),
+                "match_strategy": "fuzzy",
+                "match_confidence": round(best_score, 4),
+            }
+
+    return {
+        "ok": False,
+        "error": f"Heading '{heading}' not found in file.",
+        "available_headings": available_headings[:20],
+        "available_heading_count": len(available_headings),
+        "available_headings_truncated": len(available_headings) > 20,
+    }
+
+
+def split_frontmatter_block(text: str) -> tuple[list[str], list[str], bool]:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return [], lines, False
+
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            return lines[1:idx], lines[idx + 1:], True
+
+    return [], lines, False
+
+
+def format_frontmatter_value(value) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.match(r"^[A-Za-z0-9_./@+-]+$", stripped):
+            return stripped
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def update_frontmatter_content(text: str, updates: dict) -> str:
+    frontmatter_lines, body_lines, has_frontmatter = split_frontmatter_block(text)
+    mutable_lines = list(frontmatter_lines)
+    key_to_index = {}
+
+    for idx, line in enumerate(mutable_lines):
+        match = re.match(r"^([A-Za-z0-9_-]+):", line)
+        if match:
+            key_to_index[match.group(1)] = idx
+
+    for key, value in updates.items():
+        key_text = str(key).strip()
+        if not key_text or not re.match(r"^[A-Za-z0-9_-]+$", key_text):
+            raise ValueError(f"Invalid frontmatter key '{key}'.")
+
+        rendered_line = f"{key_text}: {format_frontmatter_value(value)}\n"
+        if key_text in key_to_index:
+            mutable_lines[key_to_index[key_text]] = rendered_line
+        else:
+            key_to_index[key_text] = len(mutable_lines)
+            mutable_lines.append(rendered_line)
+
+    if not has_frontmatter:
+        body = "".join(body_lines)
+        if body and not body.startswith("\n"):
+            body = "\n" + body
+        return "---\n" + "".join(mutable_lines) + "---\n" + body
+
+    return "---\n" + "".join(mutable_lines) + "---\n" + "".join(body_lines)
 
 def apply_deep_masking(text: str, masking_mode: str = "balanced") -> str:
     """Applies masking with per-note policy control for technical versus sensitive content."""
@@ -550,13 +844,16 @@ def search_vault(
     include_filenames: bool = True,
     context_lines: int = 1,
     filepath_filter: str = "",
+    filepath_filter_mode: str = "prefix",
 ) -> str:
     """Searches note contents and filenames and returns structured match data."""
     started_at = time.perf_counter()
     query_raw = query
     query = query.lower()
     filepath_filter_normalized = normalize_filepath_filter(filepath_filter)
-    filepath_filter_lower = filepath_filter_normalized.lower()
+    normalized_filter_mode = filepath_filter_mode.strip().lower()
+    if normalized_filter_mode not in VALID_FILEPATH_FILTER_MODES:
+        normalized_filter_mode = "prefix"
     results = []
     matched_file_count = 0
     baseline_result_tokens = 0
@@ -577,7 +874,7 @@ def search_vault(
                     rel_path = os.path.relpath(file_path, VAULT_PATH)
                     rel_path_lower = rel_path.lower()
 
-                    if filepath_filter_lower and not rel_path_lower.startswith(filepath_filter_lower):
+                    if not filepath_matches_filter(rel_path, filepath_filter_normalized, normalized_filter_mode):
                         continue
 
                     filename_matched = include_filenames and query in rel_path_lower
@@ -632,11 +929,13 @@ def search_vault(
                 "include_filenames": include_filenames,
                 "context_lines": context_lines,
                 "filepath_filter": filepath_filter,
+                "filepath_filter_mode": filepath_filter_mode,
             },
             {
                 "ok": True,
                 "query": query_raw,
                 "filepath_filter": filepath_filter_normalized or None,
+                "filepath_filter_mode": normalized_filter_mode,
                 "include_filenames": include_filenames,
                 "context_lines": context_lines,
                 "matched_file_count": 0,
@@ -656,6 +955,7 @@ def search_vault(
                 "include_filenames": include_filenames,
                 "context_lines": context_lines,
                 "filepath_filter": filepath_filter_normalized or None,
+                "filepath_filter_mode": normalized_filter_mode,
             },
             baseline_result_tokens=0,
         )
@@ -667,6 +967,7 @@ def search_vault(
         "ok": True,
         "query": query_raw,
         "filepath_filter": filepath_filter_normalized or None,
+        "filepath_filter_mode": normalized_filter_mode,
         "include_filenames": include_filenames,
         "context_lines": context_lines,
         "matched_file_count": matched_file_count,
@@ -687,6 +988,7 @@ def search_vault(
             "include_filenames": include_filenames,
             "context_lines": context_lines,
             "filepath_filter": filepath_filter,
+            "filepath_filter_mode": filepath_filter_mode,
         },
         result,
         meta={
@@ -698,6 +1000,7 @@ def search_vault(
             "include_filenames": include_filenames,
             "context_lines": context_lines,
             "filepath_filter": filepath_filter_normalized or None,
+            "filepath_filter_mode": normalized_filter_mode,
             "baseline_strategy": "full_matched_files_raw",
         },
         baseline_result_tokens=baseline_result_tokens,
@@ -969,53 +1272,544 @@ def read_note_section(
     )
 
 @mcp.tool()
-def write_note(filepath: str, content: str) -> str:
-    """Creates or overwrites a Markdown note. Please use the 'note_format' prompt beforehand for the correct layout."""
+def append_to_note(filepath: str, content: str) -> str:
+    """Appends Markdown content to the end of an existing note without rewriting the full file."""
     started_at = time.perf_counter()
     filepath, target_file = resolve_markdown_target(filepath)
+    request_args = {"filepath": filepath, "content": content}
+    meta = {"filepath_ref": TRACKER.path_ref(filepath), "content_chars": len(content)}
+
+    if not is_safe_path(filepath) or not target_file.exists():
+        return tracked_error(
+            "tool",
+            "append_to_note",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"File '{filepath}' not found or invalid path."},
+            meta=meta,
+        )
+
+    existing_content = read_text_file(target_file)
+    updated_content = append_markdown_block(existing_content, content)
+    write_text_file(target_file, updated_content)
+
+    return finalize_tracked_call(
+        "tool",
+        "append_to_note",
+        started_at,
+        request_args,
+        {
+            "ok": True,
+            "filepath": filepath,
+            "operation": "append",
+            "content_chars": len(content),
+            "source_chars": len(existing_content),
+            "result_chars": len(updated_content),
+        },
+        meta=meta | {
+            "source_chars": len(existing_content),
+            "result_chars": len(updated_content),
+        },
+    )
+
+
+@mcp.tool()
+def insert_after_heading(
+    filepath: str,
+    heading: str,
+    content: str,
+    placement: str = "end_of_section",
+    heading_fuzzy: bool = False,
+) -> str:
+    """Inserts Markdown content after a heading or at the end of that heading's section."""
+    started_at = time.perf_counter()
+    filepath, target_file = resolve_markdown_target(filepath)
+    normalized_placement = placement.strip().lower()
+    if normalized_placement not in VALID_INSERT_PLACEMENTS:
+        normalized_placement = "end_of_section"
+
+    request_args = {
+        "filepath": filepath,
+        "heading": heading,
+        "content": content,
+        "placement": placement,
+        "heading_fuzzy": heading_fuzzy,
+    }
+    meta = {
+        "filepath_ref": TRACKER.path_ref(filepath),
+        "heading_query_ref": TRACKER.path_ref(normalize_search_text(heading)),
+        "content_chars": len(content),
+    }
+
+    if not is_safe_path(filepath) or not target_file.exists():
+        return tracked_error(
+            "tool",
+            "insert_after_heading",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"File '{filepath}' not found or invalid path."},
+            meta=meta,
+        )
+
+    existing_content = read_text_file(target_file)
+    lines = existing_content.splitlines(keepends=True)
+    bounds = find_section_bounds(lines, heading, heading_fuzzy=heading_fuzzy)
+    if not bounds["ok"]:
+        return tracked_error(
+            "tool",
+            "insert_after_heading",
+            started_at,
+            request_args,
+            bounds,
+            meta=meta,
+        )
+
+    insert_index = bounds["start"] + 1 if normalized_placement == "after_heading" else bounds["end"]
+    before = "".join(lines[:insert_index])
+    after = "".join(lines[insert_index:])
+    updated_content = join_markdown_parts(before, content, after)
+    write_text_file(target_file, updated_content)
+
+    return finalize_tracked_call(
+        "tool",
+        "insert_after_heading",
+        started_at,
+        request_args,
+        {
+            "ok": True,
+            "filepath": filepath,
+            "operation": "insert_after_heading",
+            "requested_heading": heading,
+            "resolved_heading": bounds["resolved_heading"],
+            "heading_level": bounds["heading_level"],
+            "match_strategy": bounds["match_strategy"],
+            "match_confidence": bounds["match_confidence"],
+            "placement": normalized_placement,
+            "insert_line": insert_index + 1,
+            "content_chars": len(content),
+        },
+        meta=meta | {
+            "heading_level": bounds["heading_level"],
+            "match_strategy": bounds["match_strategy"],
+            "placement": normalized_placement,
+        },
+    )
+
+
+@mcp.tool()
+def replace_section(
+    filepath: str,
+    heading: str,
+    new_content: str,
+    heading_fuzzy: bool = False,
+) -> str:
+    """Replaces one Markdown section while preserving the rest of the note."""
+    started_at = time.perf_counter()
+    filepath, target_file = resolve_markdown_target(filepath)
+    request_args = {
+        "filepath": filepath,
+        "heading": heading,
+        "new_content": new_content,
+        "heading_fuzzy": heading_fuzzy,
+    }
+    meta = {
+        "filepath_ref": TRACKER.path_ref(filepath),
+        "heading_query_ref": TRACKER.path_ref(normalize_search_text(heading)),
+        "content_chars": len(new_content),
+    }
+
+    if not is_safe_path(filepath) or not target_file.exists():
+        return tracked_error(
+            "tool",
+            "replace_section",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"File '{filepath}' not found or invalid path."},
+            meta=meta,
+        )
+
+    existing_content = read_text_file(target_file)
+    lines = existing_content.splitlines(keepends=True)
+    bounds = find_section_bounds(lines, heading, heading_fuzzy=heading_fuzzy)
+    if not bounds["ok"]:
+        return tracked_error(
+            "tool",
+            "replace_section",
+            started_at,
+            request_args,
+            bounds,
+            meta=meta,
+        )
+
+    replacement = new_content.strip("\n")
+    replacement_first_line = replacement.splitlines()[0] if replacement else ""
+    if not parse_markdown_heading(replacement_first_line):
+        replacement = f"{bounds['resolved_heading']}\n\n{replacement}".rstrip("\n")
+
+    before = "".join(lines[:bounds["start"]])
+    after = "".join(lines[bounds["end"]:])
+    updated_content = join_markdown_parts(before, replacement, after)
+    write_text_file(target_file, updated_content)
+
+    return finalize_tracked_call(
+        "tool",
+        "replace_section",
+        started_at,
+        request_args,
+        {
+            "ok": True,
+            "filepath": filepath,
+            "operation": "replace_section",
+            "requested_heading": heading,
+            "resolved_heading": bounds["resolved_heading"],
+            "heading_level": bounds["heading_level"],
+            "match_strategy": bounds["match_strategy"],
+            "match_confidence": bounds["match_confidence"],
+            "replaced_line_range": [bounds["start"] + 1, bounds["end"]],
+            "content_chars": len(new_content),
+        },
+        meta=meta | {
+            "heading_level": bounds["heading_level"],
+            "match_strategy": bounds["match_strategy"],
+            "replaced_lines": bounds["end"] - bounds["start"],
+        },
+    )
+
+
+@mcp.tool()
+def update_frontmatter(filepath: str, updates: dict) -> str:
+    """Updates only YAML frontmatter keys, creating a frontmatter block when needed."""
+    started_at = time.perf_counter()
+    filepath, target_file = resolve_markdown_target(filepath)
+    request_args = {"filepath": filepath, "updates": updates}
+    meta = {
+        "filepath_ref": TRACKER.path_ref(filepath),
+        "updated_keys": sorted(str(key) for key in updates.keys()) if isinstance(updates, dict) else [],
+    }
+
+    if not isinstance(updates, dict) or not updates:
+        return tracked_error(
+            "tool",
+            "update_frontmatter",
+            started_at,
+            request_args,
+            {"ok": False, "error": "updates must be a non-empty object."},
+            meta=meta,
+        )
+
+    if not is_safe_path(filepath) or not target_file.exists():
+        return tracked_error(
+            "tool",
+            "update_frontmatter",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"File '{filepath}' not found or invalid path."},
+            meta=meta,
+        )
+
+    existing_content = read_text_file(target_file)
+    try:
+        updated_content = update_frontmatter_content(existing_content, updates)
+    except ValueError as exc:
+        return tracked_error(
+            "tool",
+            "update_frontmatter",
+            started_at,
+            request_args,
+            {"ok": False, "error": str(exc)},
+            meta=meta,
+        )
+
+    write_text_file(target_file, updated_content)
+
+    return finalize_tracked_call(
+        "tool",
+        "update_frontmatter",
+        started_at,
+        request_args,
+        {
+            "ok": True,
+            "filepath": filepath,
+            "operation": "update_frontmatter",
+            "updated_keys": sorted(str(key) for key in updates.keys()),
+            "frontmatter_created": not bool(split_frontmatter_block(existing_content)[2]),
+        },
+        meta=meta,
+    )
+
+
+@mcp.tool()
+def write_note(filepath: str, content: str, mode: str = "overwrite") -> str:
+    """Creates, overwrites, or appends to a Markdown note. Use create_only when overwrites would be unsafe."""
+    started_at = time.perf_counter()
+    filepath, target_file = resolve_markdown_target(filepath)
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in VALID_WRITE_MODES:
+        normalized_mode = "overwrite"
     meta = {
         "filepath_ref": TRACKER.path_ref(filepath),
         "content_chars": len(content),
+        "mode": normalized_mode,
     }
     
-    if not is_safe_path(filepath):
+    validation_error = validate_markdown_write_target(filepath, target_file)
+    if validation_error:
         return tracked_error(
             "tool",
             "write_note",
             started_at,
-            {"filepath": filepath, "content": content},
-            f"Error: Invalid path '{filepath}'.",
+            {"filepath": filepath, "content": content, "mode": mode},
+            validation_error,
             meta=meta,
         )
-        
-    # Only allow new notes inside existing top-level folders.
-    path_parts = Path(filepath).parts
-    if len(path_parts) > 1:
-        top_level_folder = VAULT_PATH / path_parts[0]
-        if not top_level_folder.exists():
-            return tracked_error(
-                "tool",
-                "write_note",
-                started_at,
-                {"filepath": filepath, "content": content},
-                f"Error: Structural policy prevents creating new root-level folders ('{path_parts[0]}'). Please place the note in an existing folder like '00_Inbox'. Use 'list_notes' or 'search_vault' to find the correct directory.",
-                meta=meta | {"top_level_folder": path_parts[0]},
-            )
-            
-    # Subfolders below an existing top-level folder are allowed.
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(target_file, "w", encoding="utf-8") as f:
-        f.write(content)
-        
+
+    if normalized_mode == "create_only" and target_file.exists():
+        return tracked_error(
+            "tool",
+            "write_note",
+            started_at,
+            {"filepath": filepath, "content": content, "mode": mode},
+            f"Error: File '{filepath}' already exists. Use mode='overwrite' or a surgical edit tool if you intend to modify it.",
+            meta=meta,
+        )
+
+    if normalized_mode == "append" and target_file.exists():
+        existing_content = read_text_file(target_file)
+        final_content = append_markdown_block(existing_content, content)
+    else:
+        final_content = content
+
+    write_text_file(target_file, final_content)
+
     return finalize_tracked_call(
         "tool",
         "write_note",
         started_at,
-        {"filepath": filepath, "content": content},
-        f"Note successfully written: {filepath}",
+        {"filepath": filepath, "content": content, "mode": mode},
+        f"Note successfully written: {filepath} (mode: {normalized_mode})",
         meta=meta,
     )
+
+
+@mcp.tool()
+def find_backlinks(filepath_or_title: str, filepath_filter: str = "", filepath_filter_mode: str = "prefix") -> str:
+    """Finds notes that contain real Obsidian-style wikilinks to a target note."""
+    started_at = time.perf_counter()
+    filepath_filter_normalized = normalize_filepath_filter(filepath_filter)
+    normalized_filter_mode = filepath_filter_mode.strip().lower()
+    if normalized_filter_mode not in VALID_FILEPATH_FILTER_MODES:
+        normalized_filter_mode = "prefix"
+
+    target_aliases = resolve_backlink_aliases(filepath_or_title)
+    request_args = {
+        "filepath_or_title": filepath_or_title,
+        "filepath_filter": filepath_filter,
+        "filepath_filter_mode": filepath_filter_mode,
+    }
+    meta = {
+        "target_ref": TRACKER.path_ref(filepath_or_title),
+        "filepath_filter": filepath_filter_normalized or None,
+        "filepath_filter_mode": normalized_filter_mode,
+    }
+
+    if not target_aliases:
+        return tracked_error(
+            "tool",
+            "find_backlinks",
+            started_at,
+            request_args,
+            {"ok": False, "error": "filepath_or_title must not be empty."},
+            meta=meta,
+        )
+
+    results = []
+    matched_file_count = 0
+    scanned_file_count = 0
+    scan_errors = []
+    scan_error_count = 0
+    max_scan_errors = 5
+
+    for rel_path, file_path in iter_markdown_files():
+        if not filepath_matches_filter(rel_path, filepath_filter_normalized, normalized_filter_mode):
+            continue
+
+        scanned_file_count += 1
+        file_had_match = False
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line_number, line in enumerate(f, start=1):
+                    for match in WIKILINK_CAPTURE_PATTERN.finditer(line):
+                        if normalize_wikilink_target(match.group(1)) not in target_aliases:
+                            continue
+
+                        file_had_match = True
+                        results.append(
+                            {
+                                "file": rel_path,
+                                "line": line_number,
+                                "link_text": match.group(0),
+                                "link_target": match.group(1).split("|", 1)[0].strip(),
+                                "snippet_markdown": apply_masking(line.strip()),
+                            }
+                        )
+        except Exception as exc:
+            scan_error_count += 1
+            if len(scan_errors) < max_scan_errors:
+                scan_errors.append({"file": rel_path, "error_type": type(exc).__name__})
+            continue
+
+        if file_had_match:
+            matched_file_count += 1
+
+    response_payload = {
+        "ok": True,
+        "filepath_or_title": filepath_or_title,
+        "filepath_filter": filepath_filter_normalized or None,
+        "filepath_filter_mode": normalized_filter_mode,
+        "matched_file_count": matched_file_count,
+        "scanned_file_count": scanned_file_count,
+        "result_count": len(results),
+        "scan_error_count": scan_error_count,
+        "scan_errors_truncated": scan_error_count > len(scan_errors),
+        "scan_errors": scan_errors,
+        "results": results,
+    }
+    return finalize_tracked_call(
+        "tool",
+        "find_backlinks",
+        started_at,
+        request_args,
+        response_payload,
+        meta=meta | {
+            "matched_file_count": matched_file_count,
+            "result_count": len(results),
+            "scanned_file_count": scanned_file_count,
+            "scan_error_count": scan_error_count,
+        },
+    )
+
+
+@mcp.tool()
+def move_note(source_filepath: str, target_filepath: str, update_links: bool = True) -> str:
+    """Moves or renames a note and optionally updates unambiguous wikilinks to it."""
+    started_at = time.perf_counter()
+    source_filepath, source_file = resolve_markdown_target(source_filepath)
+    target_filepath, target_file = resolve_markdown_target(target_filepath)
+    request_args = {
+        "source_filepath": source_filepath,
+        "target_filepath": target_filepath,
+        "update_links": update_links,
+    }
+    meta = {
+        "source_ref": TRACKER.path_ref(source_filepath),
+        "target_ref": TRACKER.path_ref(target_filepath),
+        "update_links": update_links,
+    }
+
+    if not is_safe_path(source_filepath) or not source_file.exists():
+        return tracked_error(
+            "tool",
+            "move_note",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"Source file '{source_filepath}' not found or invalid path."},
+            meta=meta,
+        )
+
+    validation_error = validate_markdown_write_target(target_filepath, target_file)
+    if validation_error:
+        return tracked_error(
+            "tool",
+            "move_note",
+            started_at,
+            request_args,
+            {"ok": False, "error": validation_error},
+            meta=meta,
+        )
+
+    if target_file.exists():
+        return tracked_error(
+            "tool",
+            "move_note",
+            started_at,
+            request_args,
+            {"ok": False, "error": f"Target file '{target_filepath}' already exists."},
+            meta=meta,
+        )
+
+    old_aliases = wikilink_aliases_for_path(source_filepath)
+    old_stem_alias = normalize_wikilink_target(Path(source_filepath).stem)
+    duplicate_title_paths = [
+        rel_path for rel_path, _ in iter_markdown_files()
+        if rel_path != source_filepath and normalize_search_text(Path(rel_path).stem) == normalize_search_text(Path(source_filepath).stem)
+    ]
+
+    if update_links and duplicate_title_paths:
+        for rel_path, file_path in iter_markdown_files():
+            content = read_text_file(file_path)
+            for match in WIKILINK_CAPTURE_PATTERN.finditer(content):
+                if normalize_wikilink_target(match.group(1)) == old_stem_alias:
+                    return tracked_error(
+                        "tool",
+                        "move_note",
+                        started_at,
+                        request_args,
+                        {
+                            "ok": False,
+                            "error": "Refusing to update title-only links because another note has the same title.",
+                            "ambiguous_title": Path(source_filepath).stem,
+                            "duplicate_paths": duplicate_title_paths,
+                        },
+                        meta=meta | {"ambiguous_duplicate_count": len(duplicate_title_paths)},
+                    )
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_file), str(target_file))
+
+    updated_link_files = []
+    updated_link_count = 0
+    if update_links:
+        for rel_path, file_path in iter_markdown_files():
+            try:
+                content = read_text_file(file_path)
+            except Exception:
+                continue
+
+            replacement_count = 0
+
+            def replace_match(match: re.Match[str]) -> str:
+                nonlocal replacement_count
+                replacement = build_wikilink_replacement(match, old_aliases, target_filepath)
+                if replacement != match.group(0):
+                    replacement_count += 1
+                return replacement
+
+            updated_content = WIKILINK_CAPTURE_PATTERN.sub(replace_match, content)
+            if replacement_count:
+                write_text_file(file_path, updated_content)
+                updated_link_files.append(rel_path)
+                updated_link_count += replacement_count
+
+    return finalize_tracked_call(
+        "tool",
+        "move_note",
+        started_at,
+        request_args,
+        {
+            "ok": True,
+            "operation": "move_note",
+            "source_filepath": source_filepath,
+            "target_filepath": target_filepath,
+            "updated_link_count": updated_link_count,
+            "updated_link_file_count": len(updated_link_files),
+            "updated_link_files": updated_link_files,
+        },
+        meta=meta | {
+            "updated_link_count": updated_link_count,
+            "updated_link_file_count": len(updated_link_files),
+        },
+    )
+
 
 @mcp.tool()
 def archive_note(filepath: str) -> str:
@@ -1137,6 +1931,7 @@ def find_stale_notes(days_old: int = 90) -> str:
 @mcp.tool()
 def find_unlinked_mentions(
     filepath_filter: str = "",
+    filepath_filter_mode: str = "prefix",
     min_term_length: int = 3,
     max_results: int = 50,
 ) -> str:
@@ -1145,7 +1940,9 @@ def find_unlinked_mentions(
     normalized_min_term_length = max(min_term_length, 1)
     normalized_max_results = max(max_results, 0)
     filepath_filter_normalized = normalize_filepath_filter(filepath_filter)
-    filepath_filter_lower = filepath_filter_normalized.lower()
+    normalized_filter_mode = filepath_filter_mode.strip().lower()
+    if normalized_filter_mode not in VALID_FILEPATH_FILTER_MODES:
+        normalized_filter_mode = "prefix"
     candidate_entries = collect_note_title_candidates(min_term_length=normalized_min_term_length)
     results = []
     matched_file_count = 0
@@ -1163,9 +1960,8 @@ def find_unlinked_mentions(
 
             file_path = os.path.join(root, name)
             rel_path = os.path.relpath(file_path, VAULT_PATH)
-            rel_path_lower = rel_path.lower()
 
-            if filepath_filter_lower and not rel_path_lower.startswith(filepath_filter_lower):
+            if not filepath_matches_filter(rel_path, filepath_filter_normalized, normalized_filter_mode):
                 continue
 
             scanned_file_count += 1
@@ -1248,6 +2044,7 @@ def find_unlinked_mentions(
     response_payload = {
         "ok": True,
         "filepath_filter": filepath_filter_normalized or None,
+        "filepath_filter_mode": normalized_filter_mode,
         "min_term_length": normalized_min_term_length,
         "scanned_file_count": scanned_file_count,
         "candidate_note_count": len(candidate_entries),
@@ -1266,12 +2063,14 @@ def find_unlinked_mentions(
         started_at,
         {
             "filepath_filter": filepath_filter,
+            "filepath_filter_mode": filepath_filter_mode,
             "min_term_length": min_term_length,
             "max_results": max_results,
         },
         response_payload,
         meta={
             "filepath_filter": filepath_filter_normalized or None,
+            "filepath_filter_mode": normalized_filter_mode,
             "min_term_length": normalized_min_term_length,
             "max_results": normalized_max_results,
             "candidate_note_count": len(candidate_entries),
@@ -1294,7 +2093,7 @@ def note_format() -> str:
                 f"Please format all new notes exactly according to this template:\n\n{template}\n\n"
                 f"CRITICAL INSTRUCTION: You MUST fill out the 'sources: []' YAML tag and the '## Sources' section at the bottom with explicit origin URLs or references. "
                 f"This is required so the system can verify information for depreciation later.\n"
-                f"CRITICAL INSTRUCTION 2: When updating an existing note via write_note, you MUST NOT delete the old information entirely. Instead, summarize the old state and add it to the '## Changelog / History' section, along with the date of the change, so historical knowledge is preserved.\n"
+                f"CRITICAL INSTRUCTION 2: For existing notes, prefer append_to_note, insert_after_heading, replace_section, and update_frontmatter over full write_note overwrites. You MUST NOT delete old information silently. Add a '## Changelog / History' entry with the date of the change so historical knowledge is preserved.\n"
                 f"CRITICAL INSTRUCTION 3: You MUST structure the note semantically using H2 ('##') blocks for entirely new sections. This strict hierarchy allows the LLM to navigate the note via 'read_note_section' later without consuming massive token limits.\n\n"
                 f"CRITICAL INSTRUCTION 4: You MUST set the 'mcp_masking' frontmatter field thoughtfully. Use 'balanced' for most notes, 'clear' for notes that should be returned unmasked, and 'required' for clearly sensitive people, finance, or contract content.\n\n"
                 f"CRITICAL INSTRUCTION 5: Prefer multiple small H3 subsections over large monolithic sections. If one subsection grows beyond roughly 20-30 lines, split it into another H3 with a precise title so retrieval stays token-efficient.\n\n"

@@ -39,10 +39,16 @@ obsidian-vault-mcp
         |     - get_note_outline
         |     - read_note_section
         |     - read_note
+        |     - find_backlinks
         |     - find_unlinked_mentions
         |
         +-- Write / workflow tools
         |     - write_note
+        |     - append_to_note
+        |     - insert_after_heading
+        |     - replace_section
+        |     - update_frontmatter
+        |     - move_note
         |     - archive_note
         |     - find_stale_notes
         |
@@ -77,13 +83,37 @@ Claude Desktop / any MCP-capable client
 
 Instead of treating the vault like a bag of full documents, the server encourages staged retrieval:
 
-* `search_vault` searches note contents and filenames and can limit search to a filepath prefix
+* `search_vault` searches note contents and filenames and can limit search by filepath prefix, substring, or glob
 * `get_note_outline` exposes structure before content
 * `read_note_section` reads semantically from heading to heading and supports pagination
 * `read_note` remains available as a fallback, not the default
+* `find_backlinks` finds real `[[wikilinks]]` to a target note without mixing in plain-text mentions
 * `find_unlinked_mentions` surfaces plain-text references to existing note titles that are not yet `[[wikilinks]]`
 
 This is effectively "RAG light" built on deterministic Markdown structure rather than embeddings.
+
+### Surgical Note Updates
+
+Existing notes can be updated without rewriting the whole file:
+
+* `append_to_note(filepath, content)` appends a Markdown block to an existing note
+* `insert_after_heading(filepath, heading, content)` inserts content at the end of a section by default
+* `replace_section(filepath, heading, new_content)` replaces only the matched heading section
+* `update_frontmatter(filepath, updates)` changes YAML keys without touching the body
+* `write_note(filepath, content, mode="create_only" | "overwrite" | "append")` provides overwrite safety for new-note workflows
+* `move_note(source_filepath, target_filepath, update_links=True)` moves or renames a note and updates unambiguous wikilinks
+
+Use the surgical tools for existing notes. Reserve full `write_note(..., mode="overwrite")`
+for intentional whole-file replacement.
+
+### Filepath Filters
+
+Tools with `filepath_filter` default to prefix matching for backwards compatibility.
+Use `filepath_filter_mode` when you need a different match strategy:
+
+* `prefix`: `Projects/Example_Area`
+* `substring`: `Example_Area/02`
+* `glob`: `**/Example_Area/**`
 
 ### Local Privacy Controls
 
@@ -115,6 +145,10 @@ Telemetry is optional and local-only. When enabled, it tracks:
 * Pure Python retrieval over local Markdown files
 * Structured search results instead of whole-document dumps
 * Outline-first and section-level reads for large notes
+* Section-level append, insert, and replace tools for safe note updates
+* Frontmatter-only updates for metadata changes
+* Safer `write_note` modes for create-only, overwrite, and append workflows
+* Backlink discovery and conservative wikilink updates during note moves
 * Deterministic cross-link discovery for note curation
 * Optional local telemetry with token estimates and savings reports
 * Regex plus optional Presidio-based masking

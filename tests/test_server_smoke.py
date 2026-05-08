@@ -151,6 +151,130 @@ class SearchAndTelemetryTests(unittest.TestCase):
             self.assertEqual(response["results"][0]["note_title"], "Alpha Project")
             self.assertEqual(response["results"][0]["target_paths"], ["Alpha Project.md"])
 
+    def test_search_vault_supports_substring_filepath_filter(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            nested_dir = vault_path / "Projects" / "Example_Area"
+            nested_dir.mkdir(parents=True)
+            (nested_dir / "02 Example.md").write_text("# Example\nneedle\n", encoding="utf-8")
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path), \
+                 patch.object(server, "IGNORED_FOLDERS", []):
+                response = json.loads(
+                    server.search_vault(
+                        "needle",
+                        filepath_filter="Example_Area/02",
+                        filepath_filter_mode="substring",
+                    )
+                )
+
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["matched_file_count"], 1)
+            self.assertEqual(response["results"][0]["file"], "Projects/Example_Area/02 Example.md")
+
+
+class NoteEditingToolTests(unittest.TestCase):
+    def test_append_insert_replace_and_frontmatter_update_are_surgical(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            note_path = vault_path / "Note.md"
+            note_path.write_text(
+                "---\n"
+                "title: Note\n"
+                "updated: 2026-05-01\n"
+                "---\n\n"
+                "# Note\n\n"
+                "Intro.\n\n"
+                "## Sources\n"
+                "- A\n\n"
+                "## Changelog / History\n"
+                "- Old\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path):
+                insert_response = json.loads(server.insert_after_heading("Note", "## Sources", "- B"))
+                replace_response = json.loads(server.replace_section("Note", "## Changelog / History", "- New"))
+                frontmatter_response = json.loads(
+                    server.update_frontmatter("Note", {"updated": "2026-05-08", "status": "complete"})
+                )
+                append_response = json.loads(server.append_to_note("Note", "## Tail\nDone."))
+
+            updated = note_path.read_text(encoding="utf-8")
+            self.assertTrue(insert_response["ok"])
+            self.assertTrue(replace_response["ok"])
+            self.assertTrue(frontmatter_response["ok"])
+            self.assertTrue(append_response["ok"])
+            self.assertIn("updated: 2026-05-08\n", updated)
+            self.assertIn("status: complete\n", updated)
+            self.assertIn("## Sources\n- A\n\n- B\n\n## Changelog / History", updated)
+            self.assertIn("## Changelog / History\n\n- New\n\n## Tail\nDone.\n", updated)
+            self.assertIn("Intro.", updated)
+
+    def test_update_frontmatter_creates_block_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            note_path = vault_path / "Plain.md"
+            note_path.write_text("# Plain\n", encoding="utf-8")
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path):
+                response = json.loads(server.update_frontmatter("Plain", {"updated": "2026-05-08"}))
+
+            self.assertTrue(response["ok"])
+            self.assertTrue(response["frontmatter_created"])
+            self.assertEqual(note_path.read_text(encoding="utf-8"), "---\nupdated: 2026-05-08\n---\n\n# Plain\n")
+
+    def test_write_note_create_only_refuses_overwrite_and_append_mode_appends(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            note_path = vault_path / "Existing.md"
+            note_path.write_text("# Existing\n", encoding="utf-8")
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path):
+                blocked = server.write_note("Existing", "# Replacement\n", mode="create_only")
+                appended = server.write_note("Existing", "## Added\n", mode="append")
+
+            self.assertIn("already exists", blocked)
+            self.assertIn("mode: append", appended)
+            self.assertEqual(note_path.read_text(encoding="utf-8"), "# Existing\n\n## Added\n")
+
+    def test_find_backlinks_and_move_note_update_wikilinks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vault_path = Path(tmp_dir)
+            tracker = FakeTracker()
+            source_dir = vault_path / "Projects"
+            target_dir = vault_path / "Archive"
+            source_dir.mkdir()
+            target_dir.mkdir()
+            (source_dir / "Alpha.md").write_text("# Alpha\n", encoding="utf-8")
+            (vault_path / "Journal.md").write_text(
+                "Links: [[Alpha]], [[Projects/Alpha#Details|details]], and Alpha as plain text.\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(server, "TRACKER", tracker), \
+                 patch.object(server, "VAULT_PATH", vault_path), \
+                 patch.object(server, "IGNORED_FOLDERS", []):
+                backlinks = json.loads(server.find_backlinks("Projects/Alpha.md"))
+                moved = json.loads(server.move_note("Projects/Alpha.md", "Archive/Beta.md"))
+
+            self.assertEqual(backlinks["result_count"], 2)
+            self.assertTrue(moved["ok"])
+            self.assertFalse((source_dir / "Alpha.md").exists())
+            self.assertTrue((target_dir / "Beta.md").exists())
+            journal = (vault_path / "Journal.md").read_text(encoding="utf-8")
+            self.assertIn("[[Beta]]", journal)
+            self.assertIn("[[Archive/Beta#Details|details]]", journal)
+            self.assertIn("Alpha as plain text", journal)
+
 
 class PresidioLanguageTests(unittest.TestCase):
     def test_apply_deep_masking_uses_configured_language(self):
